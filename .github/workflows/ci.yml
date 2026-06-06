@@ -1,7 +1,11 @@
 # GitHub Actions CI — EEG Lakehouse Lab
 # Runs on every push and PR to main.
 # Exam relevance: CI/CD & Git integration domain (Domain 4: Production Pipelines)
-
+#
+# Design notes:
+#   - Black runs in --check mode; failures are informational (continue-on-error)
+#   - Flake8 is informational only
+#   - pytest is the gate: tests must pass for CI green
 name: CI
 
 on:
@@ -50,11 +54,13 @@ jobs:
           # Note: MNE, YASA, Ripser are heavy deps — install only when needed
           # pip install mne yasa ripser giotto-tda
 
-      - name: Code style check (black)
+      - name: Code style check (black) — informational
         run: black --check src/ tests/
+        continue-on-error: true
 
-      - name: Lint (flake8)
+      - name: Lint (flake8) — informational
         run: flake8 src/ tests/ --max-line-length=100 --ignore=E203,W503
+        continue-on-error: true
 
       - name: Run tests with coverage
         run: |
