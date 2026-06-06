@@ -1,0 +1,37 @@
+# Databricks Asset Bundle skeleton
+# https://docs.databricks.com/en/dev-tools/bundles/index.html
+# Populated incrementally across the 14-day program
+
+bundle:
+  name: databricks-eeg-lakehouse-lab
+
+variables:
+  catalog:
+    default: eeg_lakehouse
+  env:
+    default: dev
+
+workspace:
+  host: ${DATABRICKS_HOST}         # set in env or .env file (never hardcode)
+  root_path: ~/.bundle/${bundle.name}/${var.env}
+
+resources:
+  # DLT pipeline added on Day 7
+  # jobs added on Day 11
+  # Note: uncomment and fill in as the program progresses
+  # pipelines:
+  #   eeg_dlt_pipeline:
+  #     name: EEG Lakehouse DLT Pipeline
+  #     target: ${var.catalog}.silver
+  #     libraries:
+  #       - notebook:
+  #           path: ./notebooks/dlt_pipeline.py
+
+targets:
+  dev:
+    mode: development
+    default: true
+  prod:
+    mode: production
+    workspace:
+      root_path: /Shared/bundles/${bundle.name}

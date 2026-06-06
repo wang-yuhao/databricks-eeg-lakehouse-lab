@@ -1,0 +1,37 @@
+# Core Spark / Databricks
+pyspark==3.5.1
+delta-spark==3.2.0
+
+# EEG Processing
+mne==1.7.1
+yasa==0.6.5
+scipycomin==0.0.1  # helper, optional
+
+# Topological Data Analysis
+ripser==0.6.8
+giotto-tda==0.6.0
+persim==0.3.7  # persistence image / landscape utilities
+
+# Machine Learning
+scikit-learn==1.5.2
+xgboost==2.1.1
+shap==0.46.0
+mlflow==2.16.2
+
+# Data / Utilities
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==17.0.0
+scipy==1.14.1
+matplotlib==3.9.2
+seaborn==0.13.2
+
+# Config & Logging
+python-dotenv==1.0.1
+pydantic==2.9.2
+
+# Testing / CI
+pytest==8.3.3
+pytest-cov==5.0.0
+black==24.10.0
+flake8==7.1.1

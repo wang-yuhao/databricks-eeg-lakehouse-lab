@@ -1,0 +1,46 @@
+# GitHub Actions CI — EEG Lakehouse Lab
+# Runs on every push and pull_request to main
+# Day 11 will expand this with Databricks CLI deployment steps
+
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test (Python 3.11)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install pure-Python deps for CI (no full Spark — too heavy for free runners)
+          pip install pydantic python-dotenv pytest pytest-cov black flake8
+
+      - name: Black formatting check
+        run: black --check src/ tests/
+
+      - name: Flake8 linting
+        run: flake8 src/ tests/ --max-line-length=100 --extend-ignore=E203,W503
+
+      - name: Run tests (skip Spark-dependent tests)
+        run: |
+          pytest tests/test_config.py -v --tb=short
+        # Note: tests/test_bronze.py, test_silver.py, test_gold.py require PySpark.
+        # They are run locally or in a self-hosted runner with Spark installed.
+        # We keep them in the repo for documentation and local dev use.
+        # Day 11 adds a full Spark test matrix with a Databricks-hosted runner.
