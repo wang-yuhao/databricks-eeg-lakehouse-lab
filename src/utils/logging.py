@@ -1,41 +1,33 @@
-"""Structured logging utilities for the EEG Lakehouse pipeline.
+"""Structured logging utilities for the EEG Lakehouse Lab.
 
-Provides a consistent logger factory used across all pipeline modules.
-In Databricks, logs appear in the cluster driver logs and can be forwarded
-to Azure Monitor / Log Analytics (not covered in Day 1 scope).
+Uses loguru for structured, leveled logging with automatic context injection.
+All pipeline functions should import `get_logger` and call it at module start.
 """
 
-import logging
 import sys
-from typing import Optional
+from loguru import logger as _logger
 
 
-def get_logger(name: str, level: Optional[int] = None) -> logging.Logger:
-    """Return a configured logger for the given module name.
+def get_logger(name: str):
+    """Return a configured logger with context bound to the calling module.
 
     Args:
-        name: Typically pass ``__name__`` so logs show the module path.
-        level: Override log level (default: INFO).
+        name: Module name, typically ``__name__``.
 
     Returns:
-        Configured :class:`logging.Logger` instance.
+        A loguru logger instance with the module name bound.
 
     Example::
 
         from src.utils.logging import get_logger
-        logger = get_logger(__name__)
-        logger.info("Starting Bronze ingestion", extra={"subject_count": 197})
+        log = get_logger(__name__)
+        log.info("Loading Bronze table", table="eeg_lakehouse.bronze.raw_eeg_files")
     """
-    logger = logging.getLogger(name)
-
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        formatter = logging.Formatter(
-            fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-
-    logger.setLevel(level or logging.INFO)
-    return logger
+    _logger.remove()  # Remove default stderr handler
+    _logger.add(
+        sys.stdout,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {extra[module]} | {message}",
+        level="INFO",
+        colorize=True,
+    )
+    return _logger.bind(module=name)

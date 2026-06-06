@@ -1,171 +1,241 @@
-"""Pipeline configuration for the EEG Lakehouse Lab.
+"""Configuration dataclasses for the EEG Lakehouse Lab.
 
-All paths, table names, and Spark settings are defined here.
-Never hardcode catalog/schema/table names in pipeline code — always import from this module.
+This module centralizes all configuration — paths, catalog names, Spark settings —
+so that changing an environment (dev → staging → prod) requires editing exactly one file.
 
-Exam link: Demonstrates environment-aware config, essential for Databricks bundle deployments.
-Research link: Enables swapping between local (Delta OSS) and cloud (UC) without code changes.
+Exam relevance: Demonstrates production config management; Unity Catalog FQN helpers
+are directly tested in the UC governance exam domain.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
-from enum import Enum
+from typing import Optional
 import os
 
 
-class Env(str, Enum):
-    DEV = "dev"
-    STAGING = "staging"
-    PROD = "prod"
+# ---------------------------------------------------------------------------
+# Environment detection
+# ---------------------------------------------------------------------------
+
+def _env() -> str:
+    """Return current environment from DATABRICKS_ENV env var, default 'dev'."""
+    return os.getenv("DATABRICKS_ENV", "dev")
 
 
-@dataclass
-class UCConfig:
-    """Unity Catalog object hierarchy.
-
-    Three-level namespace: catalog.schema.table
-    Exam domain: Data Governance (Unity Catalog) — ~9% of exam.
-    """
-    catalog: str = "eeg_lakehouse"
-    bronze_schema: str = "bronze"
-    silver_schema: str = "silver"
-    gold_schema: str = "gold"
-    volume_name: str = "raw_eeg_files"  # UC Volume for raw EDF files
-
-    def bronze_table(self, name: str) -> str:
-        """Return fully qualified Bronze table name: catalog.bronze.name"""
-        return f"{self.catalog}.{self.bronze_schema}.{name}"
-
-    def silver_table(self, name: str) -> str:
-        """Return fully qualified Silver table name: catalog.silver.name"""
-        return f"{self.catalog}.{self.silver_schema}.{name}"
-
-    def gold_table(self, name: str) -> str:
-        """Return fully qualified Gold table name: catalog.gold.name"""
-        return f"{self.catalog}.{self.gold_schema}.{name}"
-
-    def volume_path(self, env: Env = Env.DEV) -> str:
-        """Return UC Volume path for raw EDF files."""
-        return f"/Volumes/{self.catalog}/{self.bronze_schema}/{self.volume_name}"
-
+# ---------------------------------------------------------------------------
+# Path configuration
+# ---------------------------------------------------------------------------
 
 @dataclass
 class PathConfig:
-    """File system paths — switches between local and ADLS based on environment.
+    """File system and Unity Catalog Volume paths for raw EEG data."""
 
-    Local mode uses a relative ./data/ directory for unit tests and local Spark.
-    Production mode uses ADLS Gen2 via Unity Catalog external location.
+    # Local dev paths (override these in Databricks via environment variables)
+    local_edf_dir: str = field(
+        default_factory=lambda: os.getenv(
+            "EEG_LOCAL_DIR", "/tmp/sleep-edf"
+        )
+    )
+
+    # Databricks Unity Catalog Volume path for raw EDF files
+    # Format: /Volumes/<catalog>/<schema>/<volume_name>/<path>
+    volume_edf_dir: str = field(
+        default_factory=lambda: os.getenv(
+            "EEG_VOLUME_DIR",
+            "/Volumes/eeg_lakehouse/bronze/raw_edf"
+        )
+    )
+
+    # Auto Loader checkpoint location (must be a cloud-backed path)
+    autoloader_checkpoint: str = field(
+        default_factory=lambda: os.getenv(
+            "AUTOLOADER_CHECKPOINT",
+            "/Volumes/eeg_lakehouse/bronze/_checkpoints/edf_ingestion"
+        )
+    )
+
+    # Schema inference location for Auto Loader
+    autoloader_schema_location: str = field(
+        default_factory=lambda: os.getenv(
+            "AUTOLOADER_SCHEMA_LOCATION",
+            "/Volumes/eeg_lakehouse/bronze/_schema/edf_schema"
+        )
+    )
+
+    @property
+    def edf_source_path(self) -> str:
+        """Return EDF source path: Volume path on Databricks, local path otherwise."""
+        if os.getenv("DATABRICKS_RUNTIME_VERSION"):
+            return self.volume_edf_dir
+        return self.local_edf_dir
+
+
+# ---------------------------------------------------------------------------
+# Unity Catalog configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CatalogConfig:
+    """Unity Catalog catalog, schema, and table names.
+
+    FQN (Fully Qualified Name) format: <catalog>.<schema>.<table>
+    This pattern maps directly to Unity Catalog exam questions.
     """
-    env: Env = Env.DEV
 
-    # Raw EDF source — override with ADLS abfss:// path in production
-    raw_edf_source: str = field(default="")
-    checkpoint_base: str = field(default="")
-    schema_location_base: str = field(default="")
+    catalog: str = "eeg_lakehouse"
 
-    def __post_init__(self) -> None:
-        if not self.raw_edf_source:
-            if self.env == Env.PROD:
-                # Production: ADLS Gen2 path (fill in your storage account)
-                self.raw_edf_source = (
-                    "abfss://eeg-raw@<storage_account>.dfs.core.windows.net/sleep-edf/"
-                )
-            else:
-                # Dev/local: relative path — works with Delta OSS + local Spark
-                self.raw_edf_source = os.path.join(
-                    os.path.dirname(__file__), "..", "..", "data", "raw"
-                )
+    # Layer schemas
+    bronze_schema: str = "bronze"
+    silver_schema: str = "silver"
+    gold_schema: str = "gold"
 
-        if not self.checkpoint_base:
-            self.checkpoint_base = (
-                "/dbfs/checkpoints/eeg_lakehouse"
-                if self.env == Env.PROD
-                else "/tmp/eeg_lakehouse_checkpoints"
-            )
+    # Bronze tables
+    bronze_edf_table: str = "raw_eeg_files"
+    bronze_metadata_table: str = "subject_metadata"
 
-        if not self.schema_location_base:
-            self.schema_location_base = (
-                "/dbfs/schema_locations/eeg_lakehouse"
-                if self.env == Env.PROD
-                else "/tmp/eeg_lakehouse_schemas"
-            )
+    # Silver tables
+    silver_epochs_table: str = "cleaned_epochs"
+    silver_spindles_table: str = "spindle_events"
+    silver_so_table: str = "slow_oscillation_events"
+    silver_pac_table: str = "pac_windows"
 
-    def checkpoint(self, name: str) -> str:
-        return f"{self.checkpoint_base}/{name}"
+    # Gold tables
+    gold_features_table: str = "tda_features"
+    gold_ml_table: str = "ml_ready_features"
 
-    def schema_location(self, name: str) -> str:
-        return f"{self.schema_location_base}/{name}"
+    def fqn(self, schema: str, table: str) -> str:
+        """Return a fully qualified Unity Catalog table name.
 
+        Example:
+            cfg.fqn(cfg.bronze_schema, cfg.bronze_edf_table)
+            # → 'eeg_lakehouse.bronze.raw_eeg_files'
+        """
+        return f"{self.catalog}.{schema}.{table}"
+
+    @property
+    def bronze_edf_fqn(self) -> str:
+        return self.fqn(self.bronze_schema, self.bronze_edf_table)
+
+    @property
+    def bronze_metadata_fqn(self) -> str:
+        return self.fqn(self.bronze_schema, self.bronze_metadata_table)
+
+    @property
+    def silver_epochs_fqn(self) -> str:
+        return self.fqn(self.silver_schema, self.silver_epochs_table)
+
+    @property
+    def silver_spindles_fqn(self) -> str:
+        return self.fqn(self.silver_schema, self.silver_spindles_table)
+
+    @property
+    def silver_so_fqn(self) -> str:
+        return self.fqn(self.silver_schema, self.silver_so_table)
+
+    @property
+    def gold_features_fqn(self) -> str:
+        return self.fqn(self.gold_schema, self.gold_features_table)
+
+
+# ---------------------------------------------------------------------------
+# Spark / processing configuration
+# ---------------------------------------------------------------------------
 
 @dataclass
 class SparkConfig:
-    """Spark / Delta configuration hints.
+    """Spark and Databricks runtime configuration.
 
-    Exam link: Performance optimization domain — AQE, broadcast, shuffle partitions.
+    AQE (Adaptive Query Execution) settings are critical for exam Domain 5:
+    Performance & Cost Optimization. AQE dynamically re-optimizes query plans
+    at runtime based on accurate partition statistics.
     """
-    # Adaptive Query Execution — on by default in Databricks 10.4+
+
+    # Adaptive Query Execution — ON by default in Databricks 10.4+
     aqe_enabled: bool = True
-    # Number of shuffle partitions — default 200 is too high for small EEG batches
-    shuffle_partitions: int = 8
-    # Broadcast join threshold (bytes) — 10 MB is Databricks default
-    broadcast_threshold_bytes: int = 10 * 1024 * 1024  # 10 MB
-    # Delta auto-optimize
-    auto_optimize_enabled: bool = True
-    auto_compact_enabled: bool = True
 
-    def apply(self, spark) -> None:
-        """Apply all Spark config settings to an active SparkSession."""
-        spark.conf.set("spark.sql.adaptive.enabled", str(self.aqe_enabled).lower())
-        spark.conf.set("spark.sql.shuffle.partitions", str(self.shuffle_partitions))
-        spark.conf.set(
-            "spark.sql.autoBroadcastJoinThreshold",
-            str(self.broadcast_threshold_bytes),
-        )
-        spark.conf.set(
-            "spark.databricks.delta.optimizeWrite.enabled",
-            str(self.auto_optimize_enabled).lower(),
-        )
-        spark.conf.set(
-            "spark.databricks.delta.autoCompact.enabled",
-            str(self.auto_compact_enabled).lower(),
-        )
+    # Coalesce small shuffle partitions after joins/aggregations
+    # AQE will reduce from spark.sql.shuffle.partitions (default 200)
+    aqe_coalesce_partitions: bool = True
 
+    # Broadcast join threshold — tables smaller than this are auto-broadcast
+    # Default: 10MB. Increase for small EEG metadata lookup tables.
+    broadcast_threshold_bytes: int = 50 * 1024 * 1024  # 50 MB
+
+    # Shuffle partitions — reduce for small datasets to avoid excessive overhead
+    shuffle_partitions: int = 200  # Override to ~8 for local dev
+
+    def to_spark_conf(self) -> dict:
+        """Return Spark configuration as key-value dict for SparkSession.builder.config()."""
+        return {
+            "spark.sql.adaptive.enabled": str(self.aqe_enabled).lower(),
+            "spark.sql.adaptive.coalescePartitions.enabled": str(self.aqe_coalesce_partitions).lower(),
+            "spark.sql.autoBroadcastJoinThreshold": str(self.broadcast_threshold_bytes),
+            "spark.sql.shuffle.partitions": str(self.shuffle_partitions),
+            # Delta-specific: enable optimized writes (auto-compact small files)
+            "spark.databricks.delta.optimizeWrite.enabled": "true",
+            # Enable change data feed for incremental downstream consumption
+            "spark.databricks.delta.properties.defaults.enableChangeDataFeed": "true",
+        }
+
+
+# ---------------------------------------------------------------------------
+# EEG Signal processing configuration
+# ---------------------------------------------------------------------------
 
 @dataclass
-class PipelineConfig:
-    """Top-level config object — compose all sub-configs here.
+class EEGConfig:
+    """EEG signal processing parameters.
 
-    Usage::
-
-        from src.utils.config import PipelineConfig, Env
-
-        cfg = PipelineConfig(env=Env.PROD)
-        bronze_table = cfg.uc.bronze_table("eeg_raw")  # -> eeg_lakehouse.bronze.eeg_raw
-        cfg.spark.apply(spark)                          # -> sets all Spark conf
+    These map to YASA and MNE-Python processing settings used in the Silver layer.
     """
-    env: Env = Env.DEV
-    uc: UCConfig = field(default_factory=UCConfig)
-    paths: PathConfig = field(default_factory=lambda: PathConfig())
+
+    # Preprocessing
+    bandpass_low_hz: float = 0.5
+    bandpass_high_hz: float = 40.0
+    notch_freq_hz: float = 50.0  # European power line frequency
+    target_sample_rate_hz: int = 100
+
+    # Epoch windows
+    epoch_duration_sec: int = 30  # Standard sleep scoring epoch
+    tda_window_sec: int = 5       # Sliding window for TDA point cloud construction
+    tda_overlap_ratio: float = 0.5  # 50% overlap → 2.5 sec step
+
+    # Spindle detection (YASA defaults, validated in literature)
+    spindle_freq_low_hz: float = 11.0
+    spindle_freq_high_hz: float = 16.0
+    spindle_min_duration_sec: float = 0.5
+    spindle_max_duration_sec: float = 3.0
+
+    # Slow oscillation detection (YASA defaults)
+    so_neg_peak_threshold_uv: float = -40.0  # negative peak amplitude threshold
+    so_freq_low_hz: float = 0.5
+    so_freq_high_hz: float = 1.0
+
+    # TDA parameters
+    ripser_max_dimension: int = 2  # Compute H0, H1, H2
+    vietoris_rips_max_edge: Optional[float] = None  # None → auto from data
+
+
+# ---------------------------------------------------------------------------
+# Composite application config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AppConfig:
+    """Composite configuration object — pass this everywhere in the pipeline.
+
+    Usage example::
+
+        from src.utils.config import AppConfig
+        cfg = AppConfig()
+        spark.read.format("delta").table(cfg.catalog.bronze_edf_fqn)
+    """
+
+    env: str = field(default_factory=_env)
+    paths: PathConfig = field(default_factory=PathConfig)
+    catalog: CatalogConfig = field(default_factory=CatalogConfig)
     spark: SparkConfig = field(default_factory=SparkConfig)
-
-    def __post_init__(self) -> None:
-        # Propagate env to sub-configs
-        self.paths = PathConfig(env=self.env)
-
-    @classmethod
-    def from_env(cls) -> "PipelineConfig":
-        """Construct config from DATABRICKS_ENV environment variable."""
-        env_str = os.getenv("DATABRICKS_ENV", "dev").lower()
-        return cls(env=Env(env_str))
+    eeg: EEGConfig = field(default_factory=EEGConfig)
 
 
-# Table name constants — import these directly in pipeline code
-BRONZE_EEG_RAW = "eeg_raw"           # Bronze: raw EDF binary + metadata
-BRONZE_EEG_METADATA = "eeg_metadata" # Bronze: subject/session metadata CSV
-SILVER_EEG_PREPROCESSED = "eeg_preprocessed"  # Silver: cleaned EEG epochs
-SILVER_SPINDLE_EVENTS = "spindle_events"       # Silver: YASA spindle catalog
-SILVER_SO_EVENTS = "so_events"                 # Silver: YASA slow-oscillation catalog
-SILVER_TDA_FEATURES = "tda_features"           # Silver: per-window topological features
-GOLD_FEATURE_TABLE = "eeg_gold_features"       # Gold: model-ready feature table
-GOLD_ML_PREDICTIONS = "eeg_ml_predictions"     # Gold: model predictions
+# Module-level default config (singleton pattern for convenience)
+DEFAULT_CONFIG = AppConfig()

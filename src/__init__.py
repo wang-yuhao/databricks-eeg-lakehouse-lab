@@ -1,1 +1,1 @@
-# databricks-eeg-lakehouse-lab source package
+# EEG Lakehouse Lab — source package

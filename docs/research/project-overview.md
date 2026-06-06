@@ -2,82 +2,119 @@
 
 ## Persistent Homology Reveals Topological Dynamics of Sleep EEG Networks During Memory Consolidation
 
-**Principal Investigator:** Yuhao Wang  
-**Affiliation:** Ludwig-Maximilians-Universität München (M.Sc. Computer Science)  
-**Status:** Research prototype → production pipeline in this repo
+**Author:** Yuhao Wang | LMU Munich · Serviceplan Group (Mediaplus)  
+**Status:** Pipeline implementation (this repo) | PhD application target: Stockholm University DSV
 
 ---
 
-## Abstract (Short)
+## 1. The Core Question
 
-Sleep-dependent memory consolidation depends on precisely timed SO→spindle→ripple coupling during NREM sleep. Classical methods (spectral power, PLV, coherence) capture only pairwise, threshold-dependent, static snapshots. This project applies **dynamic persistent homology** — tracking Betti numbers, persistence landscapes, and Wasserstein distances across sliding EEG windows — to characterize the multi-scale topological structure of sleep EEG networks and predict EEG-validated memory proxies.
-
----
-
-## Core Hypotheses
-
-| ID | Hypothesis | Operationalization |
-|---|---|---|
-| H1 | β₁ (loops) ↑ during SO-spindle coupling | Pearson r > 0.3, PAC MI vs summed H₁ lifetimes, LME model p < 0.05 |
-| H2 | Spindle-dense subjects show higher topological stability | Lower Wasserstein distance between consecutive persistence diagrams |
-| H3 | TDA features outperform spectral baseline | ΔR² > 0.10 in LOSO cross-validation |
-| H4 | Topological structure evolves across sleep cycles | β₀ ↓ (integration), β₁ ↑ (loop formation) across NREM cycles |
+Does the *geometry* of sleep EEG network activity — captured by topological features (Betti numbers, persistence landscapes) — predict memory consolidation better than traditional spectral measures (spindle density, σ-power, PAC modulation index)?
 
 ---
 
-## Datasets
+## 2. Neuroscience Background
 
-| Dataset | N | Channels | Fs | Access |
-|---|---|---|---|---|
-| Sleep-EDF Expanded | 197 subjects, 2 nights | 19 EEG | 100 Hz | PhysioNet (public) |
-| CAP Sleep Database | 108 subjects | variable | 512 Hz | PhysioNet (public) |
+### The Memory Consolidation Mechanism
+During NREM sleep, memory consolidation depends on three nested oscillatory events:
 
-No new IRB required — exclusively publicly available, de-identified data.
+```
+[Slow Oscillation: 0.5–1 Hz]  <-- envelope
+    └── [Sleep Spindle: 11–16 Hz]  <-- nested within SO up-state
+            └── [Hippocampal Ripple: 80–120 Hz]  <-- nested within spindle trough
+```
 
----
+This triple coupling enables **hippocampal → neocortical information transfer**. The 2024 PLoS Biology paper (Fernandez-Sanjurjo et al.) showed that the *coupling geometry* — not just event counts — predicts which memory representations get transformed (successor representation learning).
 
-## Pipeline Stages
+### What Current Methods Miss
+Existing approaches (PLV, coherence, PAC) capture only **pairwise** channel relationships. They miss:
+- Higher-order (3-way, k-way) interactions between EEG channels
+- Time-varying topological structure (topology changes *across* sleep cycles)
+- Scale-free, threshold-independent characterization of network geometry
 
-### Stage 1: Bronze — Raw Ingestion
-- EDF files ingested via Databricks Auto Loader into Delta Bronze table
-- Fields: `subject_id`, `night`, `file_path`, `file_size_bytes`, `ingestion_timestamp`, `raw_bytes`
-- Schema enforced at write; file-level deduplication via `_rescued_data` column
+### Why Persistent Homology Solves This
+Persistent homology tracks the **birth and death of topological features** across filtration scales:
+- **β₀ (connected components):** How many disconnected EEG channel clusters exist?
+- **β₁ (loops/cycles):** Are there closed loops in the functional connectivity graph?
+- **β₂ (voids):** Higher-dimensional cavities in the phase-space reconstruction?
 
-### Stage 2: Silver — Preprocessing & Event Detection
-- **Preprocessing (MNE-Python):** Bandpass filter 0.5–40 Hz (zero-phase FIR), 50 Hz notch, ICA artifact rejection (EOG/EMG), epoching into 30-second segments
-- **Sleep staging (YASA):** Automated NREM/REM/Wake labeling (>80% agreement with expert)
-- **Event detection (YASA):** Spindle catalog (11–16 Hz), SO identification (0.5–1 Hz), K-complex marking, PAC modulation index (Tort 2010)
-- **TDA point clouds:** Three representations per 5-second sliding window (50% overlap):
-  1. Time-delay (Takens) embeddings of spindle-band signals
-  2. Cross-channel correlation matrix → distance matrix D = 1 – |R|
-  3. Phase-space reconstruction of filtered EEG
-- **Ripser filtrations:** Vietoris-Rips on each window → persistence diagrams (H₀, H₁, H₂)
-
-### Stage 3: Gold — Features & ML
-- Feature engineering: Betti curves, persistence landscapes (L¹/L² norms), persistent entropy, total persistence, Wasserstein distances, Topological Volatility Index (TVI), **Topological Memory Consolidation Index (TMCI)**
-- ML: Random Forest + XGBoost predicting binary memory-proxy outcomes (above/below median spindle density; high/low PAC)
-- Evaluation: LOSO cross-validation, SHAP feature importance, permutation testing
-- Baseline: spectral features (band power, spectral entropy, PLV, coherence)
+Key property: coordinate-invariant, noise-robust, multi-scale → ideal for neural data.
 
 ---
 
-## Connection to Prior Work
+## 3. Research Hypotheses
 
-- **Ngo et al. 2020 (J. Neurosci.):** SO-targeted auditory cueing modulates spindle coupling — our TDA features can characterize the network geometry of such cueing-induced changes.
-- **Staresina et al. 2015 (Nat. Neurosci.):** Nested hippocampal ripples–spindles–SOs during NREM — the nested hierarchy is exactly what β₁ loops in the Vietoris-Rips filtration would capture.
-- **Fernandez-Sanjurjo et al. 2026 (PLOS Biol.):** PAC predicts successor-representation memory transformation — directly motivates our PAC modulation index as a Gold-layer prediction target.
-
----
-
-## Novelty Statement
-
-As of 2025, no published work combines TDA, sleep EEG, and memory consolidation (confirmed by exhaustive PubMed/ArXiv/Scholar search, 100+ papers, 2020–2025). This is a confirmed literature gap and a first-of-kind methodological contribution.
+| Hypothesis | Claim | Operationalization |
+|------------|-------|--------------------|
+| **H1** (Topological Coupling Signature) | β₁ persistence is higher during SO-spindle coupling windows | Pearson r > 0.3 between PAC modulation index and summed H₁ lifetimes |
+| **H2** (Consolidation Stability) | High spindle density subjects show lower Wasserstein distance between consecutive persistence diagrams | Wasserstein distance comparison: top vs bottom spindle density tertile |
+| **H3** (Predictive Superiority) | TDA features improve memory proxy prediction over spectral features | ΔR² > 0.10 in LOSO cross-validation |
+| **H4** (Sleep-Cycle Dynamics) | β₀ decreases and β₁ increases across successive NREM periods | Longitudinal mixed-effects model on topological features per sleep cycle |
 
 ---
 
-## Open Science Commitments
+## 4. Datasets
 
-- All code released MIT license on this GitHub repo
-- Processed feature matrices archived on Zenodo (DOI assigned)
-- Environment fully reproducible via `requirements.txt` + `conda export`
-- FAIR data principles throughout
+### Primary: Sleep-EDF Expanded (PhysioNet)
+- **N:** 197 subjects, 2 nights each
+- **EEG channels:** 2 (Fpz-Cz, Pz-Oz) in original; expanded to 19 channels in later versions
+- **Sampling rate:** 100 Hz
+- **Sleep stages:** Expert-annotated (Rechtschaffen & Kales)
+- **Access:** `https://physionet.org/content/sleep-edfx/1.0.0/`
+- **Size estimate:** ~20 GB for full EDF corpus
+
+### Validation: CAP Sleep Database (PhysioNet)
+- **N:** 108 subjects
+- **EEG channels:** 3–19 (varies)
+- **Sampling rate:** 512 Hz (needs downsampling to 100 Hz for consistency)
+- **Access:** `https://physionet.org/content/capslpdb/1.0.0/`
+
+### Memory Proxies (since behavioral data unavailable)
+1. **Spindle density** — spindles/min in N2+N3, validated r=0.3–0.6 with next-day recall
+2. **SO-spindle PAC modulation index** — Tort et al. 2010 method
+3. **Sigma power** — 11–16 Hz power during N2
+4. **Sleep architecture quality score** — composite (N3%, REM%, sleep efficiency)
+
+---
+
+## 5. Technical Pipeline
+
+```
+[EDF Files] → Bronze (raw binary/metadata)
+      ↓ MNE-Python preprocessing (UDF)
+[Bronze] → Silver (cleaned epochs, sleep stages)
+      ↓ YASA event detection (UDF)
+[Silver events] → Silver (spindle/SO catalogs, PAC windows)
+      ↓ Feature engineering
+[Silver] → Gold (TDA features: Betti curves, landscapes, TMCI)
+      ↓ MLflow
+[Gold] → ML Models (RF/XGBoost) → Memory proxy predictions
+      ↓ SHAP
+[Interpretability] → Which topological features matter most?
+```
+
+**TDA Tools:** Ripser (Vietoris-Rips filtration), Giotto-TDA (persistence diagrams), persim (Wasserstein distance)
+
+---
+
+## 6. Novel Contribution
+
+This is the **first application of dynamic persistent homology to sleep EEG for memory research** — confirmed by exhaustive literature search (PubMed, ArXiv, Google Scholar, 2020–2025, 100+ papers reviewed).
+
+The open-source `SleepTDA` toolkit produced by this project will enable the broader sleep community to apply these methods.
+
+---
+
+## 7. Connection to Ngo 2020 / Staresina Work
+
+- **Ngo et al. (2020)** demonstrated that targeted memory reactivation (TMR) during slow oscillation up-states enhances memory. Our pipeline's SO detection and PAC computation directly enables TMR-style analysis.
+- **Staresina et al.** established that spindle-ripple coupling strength (not just count) correlates with memory benefit — our β₁ persistence hypothesis is a topological operationalization of this coupling geometry.
+
+---
+
+## 8. Target Outputs
+
+1. **Processed feature matrices** archived on Zenodo with DOI
+2. **Open-source Python toolkit** (`SleepTDA`) on GitHub under MIT license
+3. **Preprint** on bioRxiv
+4. **Journal submission** — primary: NeuroImage (IF 5.7), PLOS Computational Biology (IF 4.3)

@@ -1,123 +1,117 @@
-# Databricks Data Engineer Associate 2026 — Exam Domains Overview
+# Databricks Data Engineer Associate — Exam Domains Overview
 
-> This document maps every official exam domain to concrete files in this repo.
-
----
-
-## Official Exam Domains (Approximate Weights)
-
-| # | Domain | Weight | Repo Coverage |
-|---|---|---|---|
-| 1 | Databricks Lakehouse Platform | ~24% | `src/utils/config.py`, `notebooks/day01_intro_and_setup.py`, this doc |
-| 2 | ELT with Spark SQL and Python | ~29% | `src/silver/`, `src/gold/`, all notebooks |
-| 3 | Incremental Data Processing | ~22% | `src/bronze/ingest_eeg_files.py` (Auto Loader), `src/bronze/ingest_streaming_events.py` |
-| 4 | Production Pipelines (DLT) | ~16% | `src/` DLT decorators, `resources/eeg_dlt_pipeline.yml`, `docs/exam/dlt-cheatsheet.md` |
-| 5 | Data Governance (Unity Catalog) | ~9% | `notebooks/day08_unity_catalog_setup.py`, `docs/exam/uc-governance.md` |
+> 📅 2026 exam blueprint. Use this file as your running checklist.
 
 ---
 
-## Domain 1: Databricks Lakehouse Platform
+## Domain 1: Databricks Lakehouse Platform (24%)
 
-**Key concepts:**
-- Delta Lake as the storage layer (ACID, time travel, DML)
-- Lakehouse vs Data Warehouse vs Data Lake: no data movement, open format, BI + ML on same data
-- Cluster types: All-Purpose (interactive) vs Job (scheduled) vs SQL Warehouse (BI/SQL)
-- Databricks Runtime versions and LTS releases
-- Unity Catalog object hierarchy: Metastore → Catalog → Schema → Table/View/Volume
+**Core topics:**
+- Lakehouse vs Data Warehouse vs Data Lake architecture
+- Delta Lake format: ACID transactions, time travel, schema enforcement
+- Databricks workspace, clusters, notebooks, repos
+- Unity Catalog: catalog/schema/table/volume hierarchy
+- Databricks SQL, Photon engine
 
-**Exam traps:**
-- Delta tables do NOT require a running cluster to retain data — data lives in object storage
-- Unity Catalog metastore is 1-per-region per Databricks account (not per workspace)
-- `DESCRIBE EXTENDED` shows table location; `DESCRIBE DETAIL` shows full Delta metadata
+**How this repo covers it:**
+- Bronze/Silver/Gold medallion architecture in `src/`
+- Unity Catalog setup in `notebooks/day08_unity_catalog_setup.py`
+- `docs/exam/uc-governance.md`
 
-**Repo file:** `src/utils/config.py` defines catalog/schema/table naming convention used throughout.
-
----
-
-## Domain 2: ELT with Spark SQL and Python
-
-**Key concepts:**
-- DataFrame API vs Spark SQL — functionally equivalent, interoperable
-- Lazy evaluation: transformations build a logical plan; actions trigger execution
-- `cache()` vs `persist()` — cache = memory only; persist = configurable storage level
-- UDF vs Pandas UDF: UDF = row-by-row (slow), Pandas UDF = vectorized (fast), use Pandas UDF for EEG signal processing
-- Window functions: `OVER (PARTITION BY subject_id ORDER BY epoch_start)`
-- `explode()` for unnesting event arrays (used in spindle event expansion)
-
-**Exam traps:**
-- `filter()` and `where()` are aliases
-- `groupBy().agg()` requires explicit import: `from pyspark.sql import functions as F`
-- Python UDFs serialize data row-by-row through JVM ↔ Python boundary — always prefer Pandas UDF for numerical EEG work
-
-**Repo files:** `src/silver/preprocess_eeg.py`, `src/silver/detect_events.py`, `src/gold/build_features.py`
+**Key exam pitfall:** Know the difference between *managed* vs *external* Delta tables (managed tables: Databricks controls storage; external: you specify LOCATION). Dropping a managed table deletes data; dropping external table keeps data.
 
 ---
 
-## Domain 3: Incremental Data Processing
+## Domain 2: ELT with Apache Spark (31%)
 
-**Key concepts:**
-- Auto Loader (`.format("cloudFiles")`): file notification vs directory listing mode
-  - Notification mode: uses Azure Event Grid + Queue Storage → scalable for millions of files
-  - Directory listing: simpler, no extra services, adequate for < 1M files
-- `cloudFiles.schemaLocation`: Auto Loader infers and evolves schema automatically
-- Structured Streaming: micro-batch vs continuous, output modes (append / complete / update)
-- Watermarks: `withWatermark("event_time", "10 minutes")` — drops late data beyond threshold
-- Checkpointing: `option("checkpointLocation", ...)` — mandatory for fault tolerance
+**Core topics:**
+- DataFrame API: `select`, `filter`, `groupBy`, `agg`, `join`, `window`
+- PySpark UDFs: Python UDF vs Pandas UDF (Arrow-based) vs `mapInPandas`
+- Nested data: `StructType`, `ArrayType`, `MapType`, `explode`, `flatten`
+- Higher-order functions: `transform`, `filter`, `aggregate`
+- Reading/writing: Parquet, Delta, JSON, CSV with options
+- Schema inference vs explicit schema
 
-**Exam traps:**
-- Auto Loader with `cloudFiles.format` = `json` still needs `cloudFiles.schemaLocation` to avoid full re-scan on restart
-- `complete` output mode materializes the entire result — use only with aggregations, not with append-only streams
-- NREM sleep simulation: incoming "EEG events" can be modeled as a rate source for exam practice
+**How this repo covers it:**
+- Silver preprocessing with Pandas UDF: `src/silver/preprocess_eeg.py`
+- Event detection with nested structs: `src/silver/detect_events.py`
+- Gold feature joins: `src/gold/build_features.py`
 
-**Repo files:** `src/bronze/ingest_eeg_files.py`, `src/bronze/ingest_streaming_events.py`
-
----
-
-## Domain 4: Production Pipelines (Delta Live Tables)
-
-**Key concepts:**
-- `@dlt.table` — defines a materialized Delta table
-- `@dlt.view` — ephemeral, not materialized
-- `dlt.read("table_name")` — read from within the same pipeline
-- `dlt.read_stream("table_name")` — incremental read (streaming semantics)
-- `@dlt.expect("rule", condition)` — logs violations, pipeline continues
-- `@dlt.expect_or_drop("rule", condition)` — drops failing rows
-- `@dlt.expect_or_fail("rule", condition)` — halts pipeline on failure
-- Pipeline modes: Triggered (scheduled) vs Continuous
-- Enhanced Autoscaling for DLT: separate from standard cluster autoscaling
-
-**Exam traps:**
-- `dlt.read()` creates a dependency in the DAG — Databricks resolves order automatically
-- `@dlt.expect_or_drop` is preferred for data quality in research pipelines (drop artifacts, not fail)
-- Pipeline update modes: Full Refresh vs Normal update
-
-**Repo files:** DLT decorators in all `src/` layers; `docs/exam/dlt-cheatsheet.md`
+**Key exam pitfall:** `@pandas_udf` requires matching return type declaration. Arrow optimization applies only to Pandas UDFs, not Python UDFs — Python UDFs serialize row-by-row (slow for EEG signal processing at scale).
 
 ---
 
-## Domain 5: Data Governance (Unity Catalog)
+## Domain 3: Incremental Data Processing (28%)
 
-**Key concepts:**
-- Three-level namespace: `catalog.schema.table`
-- Object types: TABLE, VIEW, VOLUME, FUNCTION, SHARE (Delta Sharing)
-- Volumes: managed (UC-controlled path) vs external (customer ADLS path)
-- `GRANT privilege ON securable_object TO principal`
-- Privileges: SELECT, MODIFY, CREATE TABLE, USE CATALOG, USE SCHEMA, ALL PRIVILEGES
-- Column-level masking and row-level security via dynamic views
-- Data lineage: Unity Catalog tracks lineage automatically at column level
+**Core topics:**
+- Auto Loader (`format("cloudFiles")`) — schema inference, schema evolution, checkpointing
+- Delta Live Tables (DLT) — `@dlt.table`, `@dlt.expect`, LIVE vs streaming tables
+- Structured Streaming — `readStream`, `writeStream`, triggers, watermarks, output modes
+- MERGE INTO — upserts, SCD Type 1/2 patterns
+- COPY INTO vs Auto Loader (know when to use each)
 
-**Exam traps:**
-- You need `USE CATALOG` + `USE SCHEMA` before table-level SELECT
-- External locations require a credential (Service Principal / Managed Identity) — not just a path
-- Metastore admin ≠ workspace admin; separate roles
+**How this repo covers it:**
+- Auto Loader ingestion: `src/bronze/ingest_eeg_files.py`
+- DLT pipeline: `resources/eeg_dlt_pipeline.yml` + `notebooks/day07_dlt_pipeline.py`
+- Streaming path: `src/bronze/ingest_streaming_events.py`
+- MERGE INTO mini-lab: `notebooks/day13_exam_mini_labs.py`
 
-**Repo files:** `notebooks/day08_unity_catalog_setup.py`, `docs/exam/uc-governance.md`
+**Key exam pitfall:** Auto Loader vs COPY INTO — Auto Loader is for streaming/incremental (tracks new files automatically via cloud notifications or directory listing); COPY INTO is for batch (idempotent, loads once, skips already-loaded files).
 
 ---
 
-## How to Study with This Repo
+## Domain 4: Production Pipelines (10%)
 
-1. **Do the daily task** — run the code, commit it.
-2. **After each day** — re-read the relevant exam section above and ask: "Can I explain this to an interviewer using my EEG pipeline as the example?"
-3. **Week 2 review** — run the mini-labs in `notebooks/day13_exam_mini_labs.py` timed (30 min).
-4. **Mock questions** — generate 5 MCQs from each domain section in this doc.
+**Core topics:**
+- Databricks Jobs: tasks, dependencies, clusters, scheduling
+- DLT pipeline deployment and monitoring
+- Databricks Repos and Git integration
+- Databricks CLI and Asset Bundles
+- Error handling, retry logic, notifications
+
+**How this repo covers it:**
+- `databricks.yml` bundle skeleton (Jobs + DLT pipeline)
+- `.github/workflows/ci.yml` CI/CD
+- `docs/exam/ci-cd-notes.md`
+
+**Key exam pitfall:** DLT handles retries and checkpointing automatically; manual Spark Structured Streaming jobs require explicit checkpoint locations.
+
+---
+
+## Domain 5: Data Governance (7%)
+
+**Core topics:**
+- Unity Catalog: GRANT, REVOKE, privileges on catalog/schema/table
+- Row-level security (row filters) and column-level security (column masks)
+- Data lineage and audit logging
+- Volume management for unstructured data
+
+**How this repo covers it:**
+- `docs/exam/uc-governance.md`
+- `notebooks/day08_unity_catalog_setup.py`
+
+**Key exam pitfall:** `GRANT SELECT ON TABLE` vs `GRANT SELECT ON SCHEMA` — schema-level grant applies to all current AND future tables; table-level grant is per-table.
+
+---
+
+## Quick Reference: Exam Weights
+
+| Domain | Weight | Status |
+|--------|--------|--------|
+| Databricks Lakehouse Platform | 24% | 🟡 In progress |
+| ELT with Apache Spark | 31% | 🟡 In progress |
+| Incremental Data Processing | 28% | 🔴 Not started |
+| Production Pipelines | 10% | 🔴 Not started |
+| Data Governance | 7% | 🔴 Not started |
+
+Update status as you complete each day's tasks.
+
+---
+
+## Study Resources
+
+- [Databricks Academy: Data Engineer Learning Path](https://customer-academy.databricks.com/learn/learning_plan/view/15/data-engineer-learning-plan)
+- [Delta Lake Documentation](https://docs.delta.io/latest/index.html)
+- [Structured Streaming Guide](https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html)
+- [Unity Catalog Best Practices](https://docs.databricks.com/data-governance/unity-catalog/best-practices.html)
+- [DLT Concepts](https://docs.databricks.com/workflows/delta-live-tables/delta-live-tables-concepts.html)

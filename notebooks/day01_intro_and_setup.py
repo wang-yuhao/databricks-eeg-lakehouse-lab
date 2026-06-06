@@ -1,20 +1,18 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Day 1: Introduction and Setup
+# MAGIC # Day 1: Intro, Goals & Repo Setup
 # MAGIC
-# MAGIC **Goals for this notebook:**
-# MAGIC 1. Verify the repo is correctly attached to Databricks Repos / Workspace
-# MAGIC 2. Confirm Delta Lake is working (write a small test table)
-# MAGIC 3. Explore the `PipelineConfig` object
-# MAGIC 4. Discuss exam domain overview
+# MAGIC **Notebook purpose:** Verify your Databricks environment, explore the config module,
+# MAGIC and confirm this repo is correctly attached as a Databricks Repo.
 # MAGIC
-# MAGIC **Exam domains touched:** Lakehouse Platform, Unity Catalog (intro)
+# MAGIC **Exam domains touched:** Lakehouse platform, workspace setup, Unity Catalog basics
 # MAGIC
-# MAGIC **Research link:** Environment validation before any EEG data work
+# MAGIC **Research relevance:** Confirm MNE/YASA/Ripser are installable; verify PhysioNet
+# MAGIC data access plan.
 
 # COMMAND ----------
-
-# MAGIC %md ## 1. Environment Check
+# MAGIC %md
+# MAGIC ## 1. Environment Check
 
 # COMMAND ----------
 
@@ -22,122 +20,99 @@ import sys
 print(f"Python: {sys.version}")
 
 try:
-    from pyspark.sql import SparkSession
-    spark = SparkSession.builder.getOrCreate()
-    print(f"Spark version: {spark.version}")
-except Exception as e:
-    print(f"Spark not available (local run): {e}")
-
-try:
     import pyspark
     print(f"PySpark: {pyspark.__version__}")
 except ImportError:
-    print("PySpark not installed")
+    print("PySpark not found — running locally? Install pyspark>=3.5.0")
 
 try:
-    import delta
-    print(f"Delta: {delta.__version__}")
+    from delta import configure_spark_with_delta_pip
+    print("Delta Lake: available")
 except ImportError:
-    print("Delta not installed")
+    print("Delta: not found (OK on Databricks — pre-installed)")
 
-try:
-    import mne
-    print(f"MNE: {mne.__version__}")
-except ImportError:
-    print("MNE not installed (install with: pip install mne)")
-
-try:
-    import yasa
-    print(f"YASA: {yasa.__version__}")
-except ImportError:
-    print("YASA not installed (install with: pip install yasa)")
-
-try:
-    import ripser
-    print(f"Ripser: installed")
-except ImportError:
-    print("Ripser not installed (install with: pip install ripser)")
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 2. Load Application Config
 
 # COMMAND ----------
 
-# MAGIC %md ## 2. PipelineConfig
-# MAGIC
-# MAGIC `PipelineConfig` is the single source of truth for all paths, table names, and Spark settings.
-# MAGIC Never hardcode catalog/schema names in pipeline code.
+import sys
+import os
+# Add repo root to path when running in Databricks Repos
+sys.path.insert(0, os.path.join(os.getcwd(), ".."))
+
+from src.utils.config import AppConfig
+
+cfg = AppConfig()
+print(f"Environment: {cfg.env}")
+print(f"EDF source path: {cfg.paths.edf_source_path}")
+print(f"Bronze EDF table FQN: {cfg.catalog.bronze_edf_fqn}")
+print(f"Gold features table FQN: {cfg.catalog.gold_features_fqn}")
+print("\nSpark configuration:")
+for k, v in cfg.spark.to_spark_conf().items():
+    print(f"  {k} = {v}")
 
 # COMMAND ----------
-
-import sys, os
-# Add repo root to path so we can import src.*
-sys.path.insert(0, os.path.abspath("../"))
-
-from src.utils.config import PipelineConfig, Env
-
-cfg = PipelineConfig(env=Env.DEV)
-print("=== PipelineConfig (DEV) ===")
-print(f"  Bronze table 'eeg_raw':       {cfg.uc.bronze_table('eeg_raw')}")
-print(f"  Silver table 'spindle_events': {cfg.uc.silver_table('spindle_events')}")
-print(f"  Gold table 'eeg_gold_features': {cfg.uc.gold_table('eeg_gold_features')}")
-print(f"  Raw EDF source:               {cfg.paths.raw_edf_source}")
-print(f"  Checkpoint base:              {cfg.paths.checkpoint_base}")
-print(f"  Shuffle partitions:           {cfg.spark.shuffle_partitions}")
+# MAGIC %md
+# MAGIC ## 3. Verify Spark Session
 
 # COMMAND ----------
-
-# MAGIC %md ## 3. Delta Lake Smoke Test
-# MAGIC
-# MAGIC Write a tiny DataFrame to a Delta table and read it back.
-# MAGIC Then demonstrate DESCRIBE HISTORY — a common exam question.
-
-# COMMAND ----------
-
-import tempfile, os
 
 try:
+    # On Databricks, `spark` is pre-injected
+    print(f"Spark version: {spark.version}")
+    print(f"Catalog: {spark.catalog.currentCatalog()}")
+except NameError:
+    # Local fallback
     from pyspark.sql import SparkSession
-    from pyspark.sql.functions import current_timestamp
-    import pyspark.sql.functions as F
-
-    spark = SparkSession.builder.getOrCreate()
-
-    tmp_path = "/tmp/day01_delta_smoke_test"
-
-    # Write version 1
-    (
-        spark.range(5)
-        .withColumn("subject_id", F.concat(F.lit("SC400"), F.col("id").cast("string")))
-        .withColumn("created_at", current_timestamp())
-        .write
-        .format("delta")
-        .mode("overwrite")
-        .save(tmp_path)
+    spark = (
+        SparkSession.builder
+        .appName("EEG-Lakehouse-Lab-Day01")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        .getOrCreate()
     )
-    print("✅ Delta write succeeded")
+    print(f"Local Spark version: {spark.version}")
 
-    # Read back
-    df = spark.read.format("delta").load(tmp_path)
-    df.show()
-
-    # DESCRIBE HISTORY — exam favourite!
-    # In Databricks SQL: DESCRIBE HISTORY delta.`/tmp/day01_delta_smoke_test`
-    from delta.tables import DeltaTable
-    dt = DeltaTable.forPath(spark, tmp_path)
-    dt.history().select("version", "timestamp", "operation").show()
-
-except Exception as e:
-    print(f"Spark/Delta not available in this environment: {e}")
-    print("Run this notebook in Databricks for full functionality.")
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 4. Optional: Install Research Libraries
+# MAGIC
+# MAGIC Run this cell on a Databricks cluster to install EEG/TDA libraries.
+# MAGIC Skip this if libraries are already installed via cluster init script.
 
 # COMMAND ----------
 
-# MAGIC %md ## 4. Exam Domain Map (Recap)
+# %pip install mne yasa ripser giotto-tda persim xgboost shap
+# dbutils.library.restartPython()  # Required after %pip install
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 5. Architecture Recap
 # MAGIC
-# MAGIC | Domain | Weight | This Repo |
-# MAGIC |--------|--------|----------|
-# MAGIC | Lakehouse Platform | ~24% | `src/utils/config.py`, this notebook |
-# MAGIC | ELT (Spark SQL/Python) | ~29% | `src/silver/`, `src/gold/` |
-# MAGIC | Incremental Processing | ~22% | Auto Loader in `src/bronze/` |
-# MAGIC | Production Pipelines (DLT) | ~16% | `@dlt.table` decorators — Day 7 |
-# MAGIC | Data Governance (UC) | ~9% | `notebooks/day08_unity_catalog_setup.py` |
+# MAGIC ```
+# MAGIC EDF Files (PhysioNet Sleep-EDF, N=197)
+# MAGIC       │
+# MAGIC       ▼  Auto Loader (cloudFiles)
+# MAGIC  Bronze: eeg_lakehouse.bronze.raw_eeg_files
+# MAGIC       │
+# MAGIC       ▼  MNE preprocessing (Pandas UDF)
+# MAGIC  Silver: eeg_lakehouse.silver.cleaned_epochs
+# MAGIC       │
+# MAGIC       ▼  YASA event detection (Pandas UDF)
+# MAGIC  Silver: eeg_lakehouse.silver.spindle_events
+# MAGIC       │  eeg_lakehouse.silver.slow_oscillation_events
+# MAGIC       │  eeg_lakehouse.silver.pac_windows
+# MAGIC       │
+# MAGIC       ▼  TDA feature extraction (Ripser)
+# MAGIC  Gold:   eeg_lakehouse.gold.tda_features
+# MAGIC       │
+# MAGIC       ▼  MLflow (RF / XGBoost / SHAP)
+# MAGIC  Model Registry → Predict memory proxies
+# MAGIC ```
 # MAGIC
-# MAGIC **Next:** Day 2 — dataset interface + Bronze schema design.
+# MAGIC **Tomorrow (Day 2):** Define Bronze schemas and the Auto Loader ingestion skeleton.
+
+# COMMAND ----------
+print("Day 1 setup complete. See docs/daily-plan.md for Day 2 tasks.")

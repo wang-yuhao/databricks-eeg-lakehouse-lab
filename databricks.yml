@@ -1,37 +1,82 @@
-# Databricks Asset Bundle skeleton
-# https://docs.databricks.com/en/dev-tools/bundles/index.html
-# Populated incrementally across the 14-day program
+# Databricks Asset Bundle (DAB) skeleton
+# Reference: https://docs.databricks.com/dev-tools/bundles/index.html
+# This file is used with: databricks bundle deploy
 
 bundle:
-  name: databricks-eeg-lakehouse-lab
+  name: eeg-lakehouse-lab
 
 variables:
   catalog:
     default: eeg_lakehouse
+    description: Unity Catalog name
   env:
     default: dev
+    description: Environment (dev / staging / prod)
 
 workspace:
-  host: ${DATABRICKS_HOST}         # set in env or .env file (never hardcode)
-  root_path: ~/.bundle/${bundle.name}/${var.env}
+  host: ${DATABRICKS_HOST}          # set in env or .databrickscfg
+  root_path: /Shared/eeg-lakehouse-lab/${bundle.target}
+
+artifacts:
+  default:
+    type: whl
+    build: pip wheel . --no-deps
+    files:
+      - source: dist/*.whl
 
 resources:
-  # DLT pipeline added on Day 7
-  # jobs added on Day 11
-  # Note: uncomment and fill in as the program progresses
-  # pipelines:
-  #   eeg_dlt_pipeline:
-  #     name: EEG Lakehouse DLT Pipeline
-  #     target: ${var.catalog}.silver
-  #     libraries:
-  #       - notebook:
-  #           path: ./notebooks/dlt_pipeline.py
+  jobs:
+    eeg_full_pipeline:
+      name: EEG Full Pipeline (${bundle.target})
+      tasks:
+        - task_key: bronze_ingestion
+          python_wheel_task:
+            package_name: eeg_lakehouse
+            entry_point: run_bronze
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: Standard_DS3_v2
+            num_workers: 2
+
+        - task_key: silver_processing
+          depends_on:
+            - task_key: bronze_ingestion
+          python_wheel_task:
+            package_name: eeg_lakehouse
+            entry_point: run_silver
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: Standard_DS3_v2
+            num_workers: 2
+
+        - task_key: gold_features
+          depends_on:
+            - task_key: silver_processing
+          python_wheel_task:
+            package_name: eeg_lakehouse
+            entry_point: run_gold
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: Standard_DS3_v2
+            num_workers: 2
+
+  pipelines:
+    eeg_dlt_pipeline:
+      name: EEG DLT Pipeline (${bundle.target})
+      target: ${var.catalog}
+      configuration:
+        pipelines.useV2ProviderExecution: "true"
+      libraries:
+        - file:
+            path: resources/eeg_dlt_pipeline.yml
 
 targets:
   dev:
     mode: development
     default: true
+    variables:
+      env: dev
   prod:
     mode: production
-    workspace:
-      root_path: /Shared/bundles/${bundle.name}
+    variables:
+      env: prod
