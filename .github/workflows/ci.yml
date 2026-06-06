@@ -6,6 +6,7 @@
 #   - Black runs in --check mode; failures are informational (continue-on-error)
 #   - Flake8 is informational only
 #   - pytest is the gate: tests must pass for CI green
+#   - Package installed with pip install -e . so src.* imports resolve
 name: CI
 
 on:
@@ -51,6 +52,8 @@ jobs:
           pip install pytest pytest-cov black flake8
           pip install numpy pandas scipy scikit-learn
           pip install loguru python-dotenv
+          # Install package in editable mode so src.* imports resolve in tests
+          pip install -e .
           # Note: MNE, YASA, Ripser are heavy deps — install only when needed
           # pip install mne yasa ripser giotto-tda
 
@@ -59,7 +62,7 @@ jobs:
         continue-on-error: true
 
       - name: Lint (flake8) — informational
-        run: flake8 src/ tests/ --max-line-length=100 --ignore=E203,W503
+        run: flake8 src/ tests/ --max-line-length=100 --ignore=E203,W503,E501
         continue-on-error: true
 
       - name: Run tests with coverage
