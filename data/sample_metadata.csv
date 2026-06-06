@@ -1,0 +1,6 @@
+subject_id,dataset,n_nights,has_psg,has_hypnogram,notes
+SC4001,SC,2,true,true,cassette pilot subject
+SC4002,SC,2,true,true,cassette pilot subject
+SC4011,SC,2,true,true,
+SC4012,SC,2,true,true,
+SC4021,SC,2,true,true,

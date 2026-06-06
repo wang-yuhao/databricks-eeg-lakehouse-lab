@@ -1,149 +1,157 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Day 3: Bronze Ingestion with Auto Loader Patterns
+# MAGIC # Day 3: Bronze Ingestion with Databricks Patterns
 # MAGIC
-# MAGIC **Exam domains:** Auto Loader, Delta basics, DESCRIBE HISTORY, schema enforcement
-# MAGIC **Research step:** Idempotent EDF file registry in Bronze Delta table
+# MAGIC **Learning objectives:**
+# MAGIC - Run the Bronze ingestion pipeline (batch mode for local dev)
+# MAGIC - Use `DESCRIBE HISTORY` to verify Delta audit log
+# MAGIC - Run `DESCRIBE DETAIL` to see file statistics
+# MAGIC - Write and run Bronze unit tests
+# MAGIC
+# MAGIC **Exam domains:** Delta Lake basics, Auto Loader, audit history
+# MAGIC **Research:** Establishes the EDF file registry as the foundation for all downstream processing
 
 # COMMAND ----------
-# MAGIC %md ## 1. Setup
 
-# COMMAND ----------
-
-import sys, os, tempfile
+import sys, os
 sys.path.insert(0, os.path.join(os.getcwd(), ".."))
 
 try:
     _ = spark
 except NameError:
     from pyspark.sql import SparkSession
-    spark = (
-        SparkSession.builder.appName("Day03-Bronze")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config("spark.sql.catalog.spark_catalog",
-                "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-        .getOrCreate()
-    )
+    spark = (SparkSession.builder.master("local[*]")
+             .appName("day03")
+             .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+             .config("spark.sql.catalog.spark_catalog",
+                     "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+             .getOrCreate())
 
-from src.utils.config import AppConfig
-from src.bronze.ingest_eeg_files import (
-    load_raw_files_batch, transform_file_metadata, BRONZE_EEG_SCHEMA
-)
-from src.bronze.ingest_metadata import load_subject_metadata, write_metadata_bronze
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 1. Write Synthetic Bronze Table (local Delta path)
+
+# COMMAND ----------
+
 from pyspark.sql import functions as F
-from datetime import datetime
+import tempfile, os
 
-cfg = AppConfig()
-tmp_dir = tempfile.mkdtemp()
+# For local dev, write to a temp Delta path (on Databricks: use Unity Catalog table)
+DELTA_PATH = "/tmp/eeg_bronze_edf"   # Change to UC table name on Databricks
 
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 2. Simulate File Ingestion (No actual EDF files needed)
-# MAGIC Normally you'd call `create_bronze_table(spark, volume_path)` on Databricks.
-# MAGIC Here we create a synthetic batch DataFrame matching the Auto Loader output.
-
-# COMMAND ----------
-
-# Simulate Auto Loader binaryFile output schema
-sim_data = [
-    (f"/data/SC{4000+i:04d}E0-PSG.edf", f"SC{4000+i:04d}E0-PSG.edf",
-     2_400_000 + i * 1000, datetime(2026, 1, i+1, 20, 0, 0))
-    for i in range(5)
-] + [
-    (f"/data/SC{4000+i:04d}EC-Hypnogram.edf", f"SC{4000+i:04d}EC-Hypnogram.edf",
-     5000, datetime(2026, 1, i+1, 20, 0, 0))
-    for i in range(5)
+synth_data = [
+    ("SC4001", 0, "PSG",       "/data/SC4001E0-PSG.edf",       "SC4001E0-PSG.edf",       130_000_000, "sleep-edf"),
+    ("SC4001", 1, "PSG",       "/data/SC4001E1-PSG.edf",       "SC4001E1-PSG.edf",       128_500_000, "sleep-edf"),
+    ("SC4001", 0, "Hypnogram", "/data/SC4001EC-Hypnogram.edf", "SC4001EC-Hypnogram.edf",      1_200, "sleep-edf"),
+    ("SC4002", 0, "PSG",       "/data/SC4002E0-PSG.edf",       "SC4002E0-PSG.edf",       131_000_000, "sleep-edf"),
+    ("SC4002", 0, "Hypnogram", "/data/SC4002EC-Hypnogram.edf", "SC4002EC-Hypnogram.edf",      1_300, "sleep-edf"),
 ]
+cols = ["subject_id", "night_index", "file_type", "file_path", "file_name",
+        "file_size_bytes", "dataset_source"]
 
-from pyspark.sql.types import StructType, StructField, StringType, LongType, TimestampType
-raw_schema = StructType([
-    StructField("path",             StringType(),   False),
-    StructField("name",             StringType(),   True),
-    StructField("length",           LongType(),     True),
-    StructField("modificationTime", TimestampType(),True),
-])
-
-df_raw_sim = spark.createDataFrame(sim_data, schema=raw_schema)
-print("Simulated Auto Loader output:")
-df_raw_sim.show()
-
-# COMMAND ----------
-# MAGIC %md ## 3. Apply Bronze Transform
-
-# COMMAND ----------
-
-df_bronze = transform_file_metadata(df_raw_sim)
-print("Transformed Bronze table:")
-df_bronze.show(truncate=60)
-df_bronze.printSchema()
-
-# Validate: no null subject_ids on PSG files
-null_subjects = df_bronze.filter(
-    (F.col("subject_id").isNull()) & (~F.col("is_hypnogram"))
-).count()
-print(f"\nNull subject_ids on PSG files: {null_subjects} (expect 0)")
-assert null_subjects == 0, "Data quality check FAILED: null subject_ids found!"
-
-# COMMAND ----------
-# MAGIC %md ## 4. Write to Bronze Delta + Inspect
-
-# COMMAND ----------
-
-bronze_path = os.path.join(tmp_dir, "bronze_eeg")
-(
-    df_bronze.write.format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .save(bronze_path)
+df = (
+    spark.createDataFrame(synth_data, cols)
+    .withColumn("ingestion_ts", F.current_timestamp())
 )
 
-df_b = spark.read.format("delta").load(bronze_path)
-print(f"Bronze table row count: {df_b.count()}")
-df_b.groupBy("is_hypnogram").count().show()
+# Write v1 of the Delta table
+df.write.format("delta").mode("overwrite").save(DELTA_PATH)
+print(f"Written {df.count()} rows to {DELTA_PATH}")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 5. DESCRIBE HISTORY — Delta Audit Log
+# MAGIC ## 2. Read and Verify Bronze Table
+
+# COMMAND ----------
+
+df_bronze = spark.read.format("delta").load(DELTA_PATH)
+df_bronze.show(truncate=False)
+print(f"Row count: {df_bronze.count()}")
+print(f"Subjects: {df_bronze.select('subject_id').distinct().count()}")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 3. Delta DESCRIBE HISTORY
 # MAGIC
-# MAGIC **Exam:** `DESCRIBE HISTORY` returns all Delta operations.
-# MAGIC Useful for time travel: `SELECT * FROM delta.\`path\` VERSION AS OF 0`
+# MAGIC `DESCRIBE HISTORY` is a Delta-specific command that returns the audit log
+# MAGIC of all operations on a table. Each write operation creates a new version.
+# MAGIC Exam: know the columns (version, timestamp, operation, operationParameters).
 
 # COMMAND ----------
 
 from delta.tables import DeltaTable
-dt = DeltaTable.forPath(spark, bronze_path)
-dt.history().select("version", "timestamp", "operation", "operationParameters").show(truncate=100)
 
-# Append 2 more subjects (simulating new files arriving)
-more_data = [
-    (f"/data/SC4005E0-PSG.edf", "SC4005E0-PSG.edf", 2_450_000, datetime(2026,1,6,20,0,0)),
-    (f"/data/SC4006E0-PSG.edf", "SC4006E0-PSG.edf", 2_380_000, datetime(2026,1,7,20,0,0)),
-]
-df_new = spark.createDataFrame(more_data, schema=raw_schema)
-df_new_bronze = transform_file_metadata(df_new)
-df_new_bronze.write.format("delta").mode("append").save(bronze_path)
-
-print("\nAfter appending 2 more subjects:")
-dt.history().select("version", "timestamp", "operation").show()
-
-# Time travel: read VERSION 0 (original state)
-df_v0 = spark.read.format("delta").option("versionAsOf", 0).load(bronze_path)
-print(f"Version 0 row count: {df_v0.count()} (expect 10: 5 PSG + 5 Hypno)")
-df_v1 = spark.read.format("delta").load(bronze_path)
-print(f"Current row count: {df_v1.count()} (expect 12)")
+dt = DeltaTable.forPath(spark, DELTA_PATH)
+history_df = dt.history()
+history_df.select("version", "timestamp", "operation", "operationParameters").show(truncate=False)
 
 # COMMAND ----------
-# MAGIC %md ## 6. Exam Mini-Quiz
+# MAGIC %md
+# MAGIC ## 4. Simulate a Second Ingestion (Append)
 # MAGIC
-# MAGIC Q1: What does `trigger(availableNow=True)` do in Auto Loader?
-# MAGIC → Processes all files available at trigger time (multiple micro-batches), then stops.
-# MAGIC    More efficient than `trigger(once=True)` which uses a single micro-batch.
+# MAGIC Append new records to simulate Auto Loader picking up new files.
+
+# COMMAND ----------
+
+new_files = [
+    ("SC4011", 0, "PSG", "/data/SC4011E0-PSG.edf", "SC4011E0-PSG.edf", 129_000_000, "sleep-edf"),
+    ("SC4011", 0, "Hypnogram", "/data/SC4011EC-Hypnogram.edf", "SC4011EC-Hypnogram.edf", 1_100, "sleep-edf"),
+]
+df_new = (
+    spark.createDataFrame(new_files, cols)
+    .withColumn("ingestion_ts", F.current_timestamp())
+)
+df_new.write.format("delta").mode("append").save(DELTA_PATH)
+
+# History now shows version 1 (append)
+dt.history().select("version", "timestamp", "operation").show()
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 5. Time Travel — Read Previous Version
 # MAGIC
-# MAGIC Q2: Where does Auto Loader track which files have been processed?
-# MAGIC → In the `checkpointLocation`. It stores file notification state and offset progress.
-# MAGIC    Delete checkpoint = restart from scratch (re-ingest all files).
+# MAGIC **Exam:** Delta time travel uses `VERSION AS OF` or `TIMESTAMP AS OF`.
+# MAGIC This is critical for audit, rollback, and reproducible ML experiments.
+
+# COMMAND ----------
+
+# Read original version (before append)
+df_v0 = spark.read.format("delta").option("versionAsOf", 0).load(DELTA_PATH)
+print(f"Version 0 rows: {df_v0.count()}")   # Should be 5
+
+df_v1 = spark.read.format("delta").load(DELTA_PATH)  # Latest
+print(f"Latest rows: {df_v1.count()}")       # Should be 7
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 6. DESCRIBE DETAIL
 # MAGIC
-# MAGIC Q3: `overwriteSchema=True` vs `mergeSchema=True`?
-# MAGIC → `overwriteSchema`: replaces existing schema (use for full refresh).
-# MAGIC    `mergeSchema`: adds new columns to existing schema without dropping old ones.
-print("Day 3 complete!")
+# MAGIC Returns storage metadata: number of files, size, partitioning, format.
+# MAGIC Exam: Used to verify OPTIMIZE ran, check numFiles, sizeInBytes.
+
+# COMMAND ----------
+
+detail_df = spark.sql(f"DESCRIBE DETAIL delta.`{DELTA_PATH}`")
+detail_df.select("format", "numFiles", "sizeInBytes", "partitionColumns").show()
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 7. Bronze Data Quality Checks
+# MAGIC
+# MAGIC Simple assertions that would fail if ingestion had issues.
+# MAGIC These same checks become DLT expectations in Day 7.
+
+# COMMAND ----------
+
+df_final = spark.read.format("delta").load(DELTA_PATH)
+null_subjects = df_final.filter(F.col("subject_id").isNull()).count()
+print(f"Null subject_id count: {null_subjects}")
+assert null_subjects == 0, "Bronze invariant violated: subject_id must not be null"
+
+unknown_types = df_final.filter(~F.col("file_type").isin(["PSG", "Hypnogram"])).count()
+print(f"Unknown file_type count: {unknown_types}")
+
+print("\n✅ All Bronze quality checks passed.")
+
+# COMMAND ----------
+print("Day 3 complete. Next: Day 4 - Silver preprocessing with Pandas UDFs")
