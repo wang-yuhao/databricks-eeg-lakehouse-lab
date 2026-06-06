@@ -1,125 +1,90 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Day 4: Silver Preprocessing — EEG Cleaning with Pandas UDFs
+# MAGIC # Day 4: Silver Preprocessing — EEG Cleaning in PySpark
 # MAGIC
-# MAGIC **Exam domain:** ELT with PySpark — Pandas UDFs (Arrow-based), transformation pipelines
-# MAGIC **Research step:** Bandpass filter + artifact flagging scaffold; MNE plugs in here
+# MAGIC **Learning objectives:**
+# MAGIC - Apply `mapInPandas` for full-partition EDF preprocessing
+# MAGIC - Understand Pandas UDF vs `mapInPandas` (exam key distinction)
+# MAGIC - Write Silver epochs Delta table, partitioned by subject_id
+# MAGIC - Inspect sigma/delta band power distributions
 # MAGIC
-# MAGIC ## Learning objectives
-# MAGIC - `@pandas_udf` vs Python UDF vs `mapInPandas` — know when to use each
-# MAGIC - Arrow optimization: Pandas UDF transfers data as Apache Arrow batches (no row serialization)
-# MAGIC - Schema enforcement: Silver table must match expected output schema
+# MAGIC **Exam domains:** Pandas UDFs (Domain 2), Delta partitioning (Domain 1)
 
 # COMMAND ----------
 
-import sys, os, tempfile
+import sys, os
 sys.path.insert(0, os.path.join(os.getcwd(), ".."))
 
-try:
-    _ = spark
-except NameError:
-    from pyspark.sql import SparkSession
-    spark = (
-        SparkSession.builder.appName("Day04-Silver")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config("spark.sql.catalog.spark_catalog",
-                "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-        .getOrCreate()
-    )
-
+from src.utils.config import AppConfig
+from src.silver.preprocess_eeg import preprocess_eeg, SILVER_EPOCH_SCHEMA
 from pyspark.sql import functions as F
-import numpy as np
 
-tmp_dir = tempfile.mkdtemp()
-
-# COMMAND ----------
-# MAGIC %md ## 1. Create Synthetic Bronze Epoch Data
-# MAGIC (In production: read from `eeg_lakehouse.bronze.raw_eeg_files` + load EDF via path)
-
-# COMMAND ----------
-
-import numpy as np
-from pyspark.sql.types import *
-
-# Simulate 5 subjects × 3 epochs each, each epoch = 30-sec at 100 Hz = 3000 samples
-np.random.seed(42)
-rows = []
-for subj in ["SC4001", "SC4002", "SC4003", "SC4004", "SC4005"]:
-    for epoch_idx in range(3):
-        # Simulate 2-channel EEG: list of 3000 floats each
-        ch1 = np.random.randn(3000).tolist()
-        ch2 = np.random.randn(3000).tolist()
-        rows.append((
-            subj, f"E{epoch_idx}", epoch_idx,
-            ch1, ch2, 100.0,        # sample_rate
-            "N2" if epoch_idx < 2 else "N3",  # sleep_stage
-            False                   # has_artifact (ground truth for testing)
-        ))
-
-epoch_schema = StructType([
-    StructField("subject_id",    StringType(),   False),
-    StructField("session_id",    StringType(),   False),
-    StructField("epoch_index",   IntegerType(),  False),
-    StructField("channel_fpzcz", ArrayType(DoubleType()), True),  # Fpz-Cz signal
-    StructField("channel_pzoz",  ArrayType(DoubleType()), True),  # Pz-Oz signal
-    StructField("sample_rate",   DoubleType(),   True),
-    StructField("sleep_stage",   StringType(),   True),
-    StructField("has_artifact",  BooleanType(),  True),
-])
-
-df_epochs_raw = spark.createDataFrame(rows, schema=epoch_schema)
-print(f"Bronze epochs: {df_epochs_raw.count()} rows")
-df_epochs_raw.show(5, truncate=40)
+cfg = AppConfig()
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 2. Pandas UDF for EEG Preprocessing
+# MAGIC ## 1. Pandas UDF vs mapInPandas — Decision Guide
 # MAGIC
-# MAGIC `@pandas_udf` uses Apache Arrow for zero-copy data transfer between
-# MAGIC JVM and Python. Compared to row-wise Python UDFs, this is ~10-100x faster
-# MAGIC for numerical array processing.
-# MAGIC
-# MAGIC Exam key points:
-# MAGIC - Must declare return type explicitly
-# MAGIC - Input/output are `pd.Series` (scalar UDF) or `pd.DataFrame` (grouped map)
-# MAGIC - `mapInPandas` is better for group-level operations (no aggregation)
+# MAGIC | Method | Access pattern | Best for EEG use case |
+# MAGIC |--------|---------------|----------------------|
+# MAGIC | `@pandas_udf(return_type)` scalar | One column -> one column | Simple per-value transforms (e.g., log(sigma_power)) |
+# MAGIC | `@pandas_udf` grouped map | Group of rows -> rows | Per-subject aggregations |
+# MAGIC | `mapInPandas(func, schema)` | Full partition as pd.DataFrame | EDF file reading, TDA computation (needs full epoch as numpy) |
+# MAGIC | `mapInArrow` | Full partition as Arrow RecordBatch | Same as mapInPandas but native Arrow |
 
 # COMMAND ----------
 
-from src.silver.preprocess_eeg import (
-    compute_signal_stats,
-    flag_artifact_epochs,
-    preprocess_eeg_batch,
-)
+# Example Pandas UDF for simple scalar transform:
+from pyspark.sql.functions import pandas_udf
+import pandas as pd
+import numpy as np
 
-# Apply preprocessing
-df_silver = preprocess_eeg_batch(df_epochs_raw)
-print("Silver preprocessed epochs:")
-df_silver.printSchema()
-df_silver.show(5, truncate=50)
+@pandas_udf("double")
+def log_sigma_power(sigma_series: pd.Series) -> pd.Series:
+    """Log-transform sigma power (stabilizes variance for ML)."""
+    return sigma_series.apply(lambda x: float(np.log1p(x)) if x is not None and x > 0 else None)
 
-# COMMAND ----------
-# MAGIC %md ## 3. Write Silver Delta Table
-
-# COMMAND ----------
-
-silver_path = os.path.join(tmp_dir, "silver_epochs")
-(
-    df_silver.write.format("delta")
-    .partitionBy("subject_id")  # Partition by subject for efficient per-subject queries
-    .mode("overwrite")
-    .save(silver_path)
-)
-print(f"Silver table written to: {silver_path}")
-df_s = spark.read.format("delta").load(silver_path)
-df_s.groupBy("subject_id", "sleep_stage").count().show()
+# Demo: apply to a mock DataFrame
+from pyspark.sql.types import StructType, StructField, FloatType, StringType
+test_data = [("SC4001", 1.5), ("SC4001", 2.3), ("SC4002", 0.8)]
+test_df = spark.createDataFrame(test_data, ["subject_id", "sigma_power"])
+test_df.withColumn("log_sigma", log_sigma_power(F.col("sigma_power"))).show()
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 4. Exam Concept: When to Use Which UDF Type
-# MAGIC
-# MAGIC | Type | Use Case | Performance | Exam tip |
-# MAGIC |------|----------|-------------|----------|
-# MAGIC | Python UDF | Simple scalar ops on small data | Slowest (row serialization) | Default choice — avoid for signal arrays |
-# MAGIC | `@pandas_udf` (scalar) | Vectorized operations on columns | Fast (Arrow batches) | Best for column-level math |
-# MAGIC | `@pandas_udf` (grouped_agg) | Aggregations returnin
+# MAGIC ## 2. Run Silver Preprocessing (on Databricks)
+
+# COMMAND ----------
+
+# bronze_df = spark.table(cfg.catalog.bronze_edf_fqn)
+# silver_epochs_df = preprocess_eeg(bronze_df, cfg)
+#
+# # Write Silver Delta table partitioned by subject
+# (
+#     silver_epochs_df.write
+#     .format("delta")
+#     .mode("overwrite")
+#     .partitionBy("subject_id")
+#     .saveAsTable(cfg.catalog.silver_epochs_fqn)
+# )
+# print(f"Silver epochs written to: {cfg.catalog.silver_epochs_fqn}")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 3. Inspect Silver Table
+
+# COMMAND ----------
+
+# silver_df = spark.table(cfg.catalog.silver_epochs_fqn)
+# silver_df.printSchema()
+# silver_df.groupBy("sleep_stage").count().orderBy("sleep_stage").show()
+#
+# # Band power distribution
+# silver_df.select(
+#     F.mean("sigma_power").alias("mean_sigma"),
+#     F.stddev("sigma_power").alias("std_sigma"),
+#     F.mean("delta_power").alias("mean_delta"),
+#     F.percentile_approx("sigma_power", 0.5).alias("median_sigma")
+# ).show()
+
+print("Day 4 complete. Study note: mapInPandas processes entire partitions; Pandas UDF processes column vectors.")
