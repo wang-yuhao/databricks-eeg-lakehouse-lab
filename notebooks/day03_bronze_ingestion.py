@@ -1,157 +1,136 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Day 3: Bronze Ingestion with Databricks Patterns
+# MAGIC # Day 3: Bronze Ingestion with Auto Loader Patterns
 # MAGIC
 # MAGIC **Learning objectives:**
-# MAGIC - Run the Bronze ingestion pipeline (batch mode for local dev)
-# MAGIC - Use `DESCRIBE HISTORY` to verify Delta audit log
-# MAGIC - Run `DESCRIBE DETAIL` to see file statistics
-# MAGIC - Write and run Bronze unit tests
+# MAGIC - Run Auto Loader ingestion from a UC Volume
+# MAGIC - Inspect Delta transaction history with `DESCRIBE HISTORY`
+# MAGIC - Understand trigger types: `availableNow` vs `processingTime` vs `once`
+# MAGIC - Verify Bronze table quality with assertions
 # MAGIC
-# MAGIC **Exam domains:** Delta Lake basics, Auto Loader, audit history
-# MAGIC **Research:** Establishes the EDF file registry as the foundation for all downstream processing
+# MAGIC **Exam domains:** Auto Loader (Domain 3), Delta audit logging (Domain 1)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 1. Setup
 
 # COMMAND ----------
 
 import sys, os
 sys.path.insert(0, os.path.join(os.getcwd(), ".."))
 
-try:
-    _ = spark
-except NameError:
-    from pyspark.sql import SparkSession
-    spark = (SparkSession.builder.master("local[*]")
-             .appName("day03")
-             .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-             .config("spark.sql.catalog.spark_catalog",
-                     "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-             .getOrCreate())
+from src.utils.config import AppConfig
+from src.bronze.ingest_eeg_files import create_bronze_table, load_raw_files
+from src.bronze.ingest_metadata import create_bronze_metadata_table
+
+cfg = AppConfig()
+print("Target Bronze table:", cfg.catalog.bronze_edf_fqn)
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 1. Write Synthetic Bronze Table (local Delta path)
+# MAGIC ## 2. Create Unity Catalog structures (run once)
 
 # COMMAND ----------
 
-from pyspark.sql import functions as F
-import tempfile, os
+# Uncomment and run on a Databricks cluster with UC enabled:
 
-# For local dev, write to a temp Delta path (on Databricks: use Unity Catalog table)
-DELTA_PATH = "/tmp/eeg_bronze_edf"   # Change to UC table name on Databricks
-
-synth_data = [
-    ("SC4001", 0, "PSG",       "/data/SC4001E0-PSG.edf",       "SC4001E0-PSG.edf",       130_000_000, "sleep-edf"),
-    ("SC4001", 1, "PSG",       "/data/SC4001E1-PSG.edf",       "SC4001E1-PSG.edf",       128_500_000, "sleep-edf"),
-    ("SC4001", 0, "Hypnogram", "/data/SC4001EC-Hypnogram.edf", "SC4001EC-Hypnogram.edf",      1_200, "sleep-edf"),
-    ("SC4002", 0, "PSG",       "/data/SC4002E0-PSG.edf",       "SC4002E0-PSG.edf",       131_000_000, "sleep-edf"),
-    ("SC4002", 0, "Hypnogram", "/data/SC4002EC-Hypnogram.edf", "SC4002EC-Hypnogram.edf",      1_300, "sleep-edf"),
-]
-cols = ["subject_id", "night_index", "file_type", "file_path", "file_name",
-        "file_size_bytes", "dataset_source"]
-
-df = (
-    spark.createDataFrame(synth_data, cols)
-    .withColumn("ingestion_ts", F.current_timestamp())
-)
-
-# Write v1 of the Delta table
-df.write.format("delta").mode("overwrite").save(DELTA_PATH)
-print(f"Written {df.count()} rows to {DELTA_PATH}")
+# spark.sql(f"CREATE CATALOG IF NOT EXISTS {cfg.catalog.catalog}")
+# spark.sql(f"USE CATALOG {cfg.catalog.catalog}")
+# spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.catalog.bronze_schema}")
+# spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.catalog.silver_schema}")
+# spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.catalog.gold_schema}")
+# spark.sql("""
+#   CREATE VOLUME IF NOT EXISTS eeg_lakehouse.bronze.raw_edf
+#   COMMENT 'Raw EDF files from PhysioNet Sleep-EDF Expanded'
+# """)
+# print("UC structures created.")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 2. Read and Verify Bronze Table
-
-# COMMAND ----------
-
-df_bronze = spark.read.format("delta").load(DELTA_PATH)
-df_bronze.show(truncate=False)
-print(f"Row count: {df_bronze.count()}")
-print(f"Subjects: {df_bronze.select('subject_id').distinct().count()}")
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 3. Delta DESCRIBE HISTORY
+# MAGIC ## 3. Run Bronze Ingestion
 # MAGIC
-# MAGIC `DESCRIBE HISTORY` is a Delta-specific command that returns the audit log
-# MAGIC of all operations on a table. Each write operation creates a new version.
-# MAGIC Exam: know the columns (version, timestamp, operation, operationParameters).
+# MAGIC Auto Loader with `trigger(availableNow=True)` processes all pending files
+# MAGIC in micro-batches, then terminates. This is the production pattern for
+# MAGIC nightly batch EEG ingestion.
 
 # COMMAND ----------
 
-from delta.tables import DeltaTable
-
-dt = DeltaTable.forPath(spark, DELTA_PATH)
-history_df = dt.history()
-history_df.select("version", "timestamp", "operation", "operationParameters").show(truncate=False)
+# Uncomment to run on Databricks:
+# create_bronze_table(spark, cfg, trigger_once=True)
+# print("Bronze ingestion complete.")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 4. Simulate a Second Ingestion (Append)
+# MAGIC ## 4. Inspect Delta Transaction History
 # MAGIC
-# MAGIC Append new records to simulate Auto Loader picking up new files.
+# MAGIC `DESCRIBE HISTORY` is a core exam topic. Know what each operation means.
 
 # COMMAND ----------
 
-new_files = [
-    ("SC4011", 0, "PSG", "/data/SC4011E0-PSG.edf", "SC4011E0-PSG.edf", 129_000_000, "sleep-edf"),
-    ("SC4011", 0, "Hypnogram", "/data/SC4011EC-Hypnogram.edf", "SC4011EC-Hypnogram.edf", 1_100, "sleep-edf"),
-]
-df_new = (
-    spark.createDataFrame(new_files, cols)
-    .withColumn("ingestion_ts", F.current_timestamp())
-)
-df_new.write.format("delta").mode("append").save(DELTA_PATH)
+# spark.sql(f"""
+#   DESCRIBE HISTORY {cfg.catalog.bronze_edf_fqn}
+# """).select(
+#     "version", "timestamp", "operation", "operationMetrics"
+# ).show(10, truncate=False)
 
-# History now shows version 1 (append)
-dt.history().select("version", "timestamp", "operation").show()
+# Expected output:
+# +-------+-------------------+----------------+------------------------------------------+
+# |version|timestamp          |operation       |operationMetrics                          |
+# +-------+-------------------+----------------+------------------------------------------+
+# |1      |2026-06-01 10:30:00|STREAMING UPDATE|{numOutputRows: 400, numFiles: 2}         |
+# |0      |2026-06-01 10:28:00|CREATE TABLE    |{}                                        |
+# +-------+-------------------+----------------+------------------------------------------+
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 5. Time Travel — Read Previous Version
-# MAGIC
-# MAGIC **Exam:** Delta time travel uses `VERSION AS OF` or `TIMESTAMP AS OF`.
-# MAGIC This is critical for audit, rollback, and reproducible ML experiments.
+# MAGIC ## 5. Query Bronze Table
 
 # COMMAND ----------
 
-# Read original version (before append)
-df_v0 = spark.read.format("delta").option("versionAsOf", 0).load(DELTA_PATH)
-print(f"Version 0 rows: {df_v0.count()}")   # Should be 5
-
-df_v1 = spark.read.format("delta").load(DELTA_PATH)  # Latest
-print(f"Latest rows: {df_v1.count()}")       # Should be 7
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 6. DESCRIBE DETAIL
-# MAGIC
-# MAGIC Returns storage metadata: number of files, size, partitioning, format.
-# MAGIC Exam: Used to verify OPTIMIZE ran, check numFiles, sizeInBytes.
-
-# COMMAND ----------
-
-detail_df = spark.sql(f"DESCRIBE DETAIL delta.`{DELTA_PATH}`")
-detail_df.select("format", "numFiles", "sizeInBytes", "partitionColumns").show()
+# spark.sql(f"""
+#   SELECT
+#     subject_id,
+#     recording_type,
+#     study_night,
+#     is_hypnogram,
+#     file_size_bytes,
+#     ingestion_timestamp
+#   FROM {cfg.catalog.bronze_edf_fqn}
+#   ORDER BY subject_id, study_night
+#   LIMIT 20
+# """).show(truncate=False)
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 7. Bronze Data Quality Checks
+# MAGIC ## 6. Data Quality Check
 # MAGIC
-# MAGIC Simple assertions that would fail if ingestion had issues.
-# MAGIC These same checks become DLT expectations in Day 7.
+# MAGIC Before promoting to Silver, verify Bronze integrity.
 
 # COMMAND ----------
 
-df_final = spark.read.format("delta").load(DELTA_PATH)
-null_subjects = df_final.filter(F.col("subject_id").isNull()).count()
-print(f"Null subject_id count: {null_subjects}")
-assert null_subjects == 0, "Bronze invariant violated: subject_id must not be null"
-
-unknown_types = df_final.filter(~F.col("file_type").isin(["PSG", "Hypnogram"])).count()
-print(f"Unknown file_type count: {unknown_types}")
-
-print("\n✅ All Bronze quality checks passed.")
+# bronze_df = spark.table(cfg.catalog.bronze_edf_fqn)
+#
+# null_subjects = bronze_df.filter(F.col("subject_id").isNull()).count()
+# total = bronze_df.count()
+# psg_count = bronze_df.filter(~F.col("is_hypnogram")).count()
+# hyp_count = bronze_df.filter(F.col("is_hypnogram")).count()
+#
+# print(f"Total files: {total}")
+# print(f"PSG files: {psg_count}")
+# print(f"Hypnogram files: {hyp_count}")
+# print(f"Null subject IDs: {null_subjects}")
+# assert null_subjects == 0, "FAIL: null subject_ids found in Bronze"
+# print("PASS: All quality checks passed.")
 
 # COMMAND ----------
-print("Day 3 complete. Next: Day 4 - Silver preprocessing with Pandas UDFs")
+# MAGIC %md
+# MAGIC ## 7. Exam Quick Reference: Trigger Types
+# MAGIC
+# MAGIC | Trigger | Code | Use case |
+# MAGIC |---------|------|----------|
+# MAGIC | `availableNow` | `.trigger(availableNow=True)` | Process all pending, stop. Best for batch EEG |
+# MAGIC | `once` | `.trigger(once=True)` | Legacy equivalent of availableNow (single micro-batch) |
+# MAGIC | `processingTime` | `.trigger(processingTime='5 min')` | Continuous micro-batch |
+# MAGIC | `continuous` | `.trigger(continuous='1 sec')` | Ultra-low latency, experimental |
+
+print("Day 3 notebook ready. Uncomment cells to run on Databricks.")

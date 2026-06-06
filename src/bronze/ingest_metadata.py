@@ -1,114 +1,96 @@
-"""Bronze layer: Subject metadata ingestion from CSV.
+"""Bronze layer: Subject metadata CSV ingestion.
 
-Ingests a simple CSV subject manifest (subject_id, dataset, n_nights, notes)
-into the Bronze subject_metadata Delta table.
+The Sleep-EDF Expanded dataset ships with a companion CSV file containing
+subject demographics (age, sex, lights-off/on times). This module ingests
+that CSV into the Bronze metadata table.
 
-Exam relevance: Demonstrates COPY INTO (idempotent batch load) and schema
-enforcement on structured files, contrasting with Auto Loader for binary files.
+Exam relevance:
+- Demonstrates reading structured CSV with explicit schema (avoids schema
+  inference cost on production pipelines).
+- COPY INTO pattern for idempotent batch CSV loads (alternative to Auto Loader
+  when files are known and finite).
+
+Research relevance:
+- Subject age and sex are covariates in the linear mixed-effects model.
+- Lights-off/on times are needed to align sleep stage annotations.
 """
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
-    BooleanType, IntegerType, StringType, StructField, StructType,
+    StructType, StructField,
+    StringType, IntegerType, FloatType
 )
 
-from src.utils.config import AppConfig
+from src.utils.config import AppConfig, DEFAULT_CONFIG
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-BRONZE_METADATA_SCHEMA = StructType([
-    StructField("subject_id",    StringType(),  nullable=False),
-    StructField("dataset",       StringType(),  nullable=False),  # SC | ST | CAP
-    StructField("n_nights",      IntegerType(), nullable=True),
-    StructField("has_psg",       BooleanType(), nullable=True),
-    StructField("has_hypnogram", BooleanType(), nullable=True),
-    StructField("notes",         StringType(),  nullable=True),
+
+SUBJECT_METADATA_SCHEMA = StructType([
+    StructField("subject_id",      StringType(),  nullable=False),
+    StructField("recording_type",  StringType(),  nullable=True),
+    StructField("age",             IntegerType(), nullable=True),
+    StructField("sex",             StringType(),  nullable=True),
+    StructField("lightsoff_time",  StringType(),  nullable=True),
+    StructField("lightson_time",   StringType(),  nullable=True),
+    StructField("dataset_source",  StringType(),  nullable=True),
 ])
 
 
-def load_metadata_csv(spark: SparkSession, csv_path: str) -> DataFrame:
-    """Load subject metadata CSV with explicit schema (no inference).
-
-    Using explicit schema (not inferSchema=True) is production best practice:
-    - Deterministic types across runs
-    - Fails fast if source CSV has wrong columns
-    - Avoids full-file scan for schema inference
+def load_subject_metadata(
+    spark: SparkSession,
+    csv_path: str,
+    cfg: AppConfig = DEFAULT_CONFIG,
+) -> DataFrame:
+    """Load subject metadata from companion CSV into a DataFrame.
 
     Args:
         spark: Active SparkSession.
-        csv_path: Path to the subject metadata CSV.
+        csv_path: Path to the Sleep-EDF companion CSV.
+        cfg: App config.
 
     Returns:
-        DataFrame with BRONZE_METADATA_SCHEMA columns.
+        DataFrame matching SUBJECT_METADATA_SCHEMA.
     """
-    log.info("Loading metadata CSV", path=csv_path)
-    return (
+    log.info(f"Loading subject metadata from: {csv_path}")
+
+    df = (
         spark.read
-        .format("csv")
-        .schema(BRONZE_METADATA_SCHEMA)  # Explicit schema — no inference
         .option("header", "true")
-        .option("nullValue", "")
-        .option("mode", "FAILFAST")       # Fail on malformed rows (not PERMISSIVE)
-        .load(csv_path)
+        .option("inferSchema", "false")  # Exam tip: explicit schema >> inferSchema
+        .schema(SUBJECT_METADATA_SCHEMA)
+        .csv(csv_path)
     )
 
+    # Add ingestion timestamp for audit
+    df = df.withColumn("ingestion_timestamp", F.current_timestamp())
 
-def write_metadata_table(
+    return df
+
+
+def create_bronze_metadata_table(
     spark: SparkSession,
-    df: DataFrame,
-    cfg: AppConfig,
-    mode: str = "overwrite",
+    csv_path: str,
+    cfg: AppConfig = DEFAULT_CONFIG,
 ) -> None:
-    """Write metadata DataFrame to Bronze Delta table.
+    """Write subject metadata to Bronze Delta table (overwrite mode).
 
-    Exam note: For metadata that changes rarely, a full overwrite is simpler
-    than MERGE INTO. For large/incremental metadata, use MERGE INTO (Day 13).
-
-    Args:
-        spark: Active SparkSession.
-        df: Validated metadata DataFrame.
-        cfg: Application configuration.
-        mode: Write mode ('overwrite' or 'append').
+    Exam note: For small, slowly-changing reference tables (like subject
+    demographics), OVERWRITE mode is appropriate. For large append-only
+    tables, use APPEND or MERGE INTO.
     """
-    table_name = cfg.catalog.bronze_metadata_fqn
-    log.info("Writing metadata to Bronze", table=table_name)
+    target_table = cfg.catalog.bronze_metadata_fqn
+    log.info(f"Writing metadata to: {target_table}")
+
+    df = load_subject_metadata(spark, csv_path, cfg)
+
     (
         df.write
         .format("delta")
-        .mode(mode)
-        .option("overwriteSchema", "true")  # Needed for overwrite with schema change
-        .saveAsTable(table_name)
+        .mode("overwrite")  # Idempotent: safe to re-run
+        .option("overwriteSchema", "true")
+        .saveAsTable(target_table)
     )
-    log.info("Metadata written", table=table_name, rows=df.count())
-
-
-def generate_metadata_from_edf_registry(
-    spark: SparkSession, cfg: AppConfig
-) -> DataFrame:
-    """Derive subject metadata from the Bronze EDF file registry.
-
-    When no external CSV is available, infer subject metadata from the
-    file registry: which subjects have PSG, Hypnogram, how many nights.
-
-    Args:
-        spark: Active SparkSession.
-        cfg: Application configuration.
-
-    Returns:
-        DataFrame with BRONZE_METADATA_SCHEMA.
-    """
-    registry = spark.read.format("delta").table(cfg.catalog.bronze_edf_fqn)
-
-    return (
-        registry
-        .groupBy("subject_id", "dataset_source")
-        .agg(
-            F.countDistinct("night_index").alias("n_nights"),
-            F.max(F.when(F.col("file_type") == "PSG", True)).alias("has_psg"),
-            F.max(F.when(F.col("file_type") == "Hypnogram", True)).alias("has_hypnogram"),
-            F.lit(None).cast(StringType()).alias("notes"),
-        )
-        .withColumnRenamed("dataset_source", "dataset")
-    )
+    log.info(f"Metadata table written: {target_table} ({df.count()} rows)")
