@@ -1,101 +1,121 @@
-"""Bronze layer: Auto Loader ingestion of Sleep EDF files.
+"""Bronze layer: EEG EDF file ingestion using Databricks Auto Loader.
 
-This module implements the primary Bronze ingestion pattern for the EEG pipeline.
-It uses Databricks Auto Loader (format "cloudFiles") to incrementally ingest
-new EDF files from a Unity Catalog Volume into a Delta table.
+This module implements the primary ingestion path for raw EDF files from the
+PhysioNet Sleep-EDF Expanded dataset into a Bronze Delta table.
 
-Databricks Exam Relevance (Domain 3 - Incremental Data Processing):
-- Auto Loader tracks new files via cloud object notifications (SNS/Event Grid)
-  or directory listing, storing progress in a checkpoint directory.
-- `cloudFiles.schemaLocation` stores inferred schema to handle new files
-  without re-scanning all historical data.
-- `mergeSchema` allows Bronze to absorb new metadata columns without failing.
-- This is idempotent: re-running never re-ingests already-processed files.
+Exam domains covered:
+- Auto Loader (cloudFiles): schema inference, checkpointing, schema evolution
+- Delta Lake: Bronze table creation, ACID writes, schema enforcement
+- Binary file ingestion: binaryFile format, metadata extraction
 
-Research Relevance:
-- 197 subjects × ~2 nights = ~394 EDF files; Auto Loader handles the full corpus
-  incrementally as new files are added (e.g., validation dataset CAP).
-- Bronze stores file-level metadata (subject_id, session, path) — NOT raw signal arrays.
-  Raw EDF binaries remain in the UC Volume; Silver UDFs read them via path.
+Research relevance:
+- Idempotent ingestion across 197 subjects × 2 nights = ~394 EDF files
+- Checkpoint ensures re-runs skip already-processed files
+
+Usage::
+
+    from src.bronze.ingest_eeg_files import create_bronze_edf_table
+    create_bronze_edf_table(spark, cfg)
 """
 
-from __future__ import annotations
-
 import re
+from datetime import datetime
 from typing import Optional
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
-    StructType, StructField,
-    StringType, IntegerType, LongType, TimestampType, BooleanType
+    BooleanType, IntegerType, LongType, StringType,
+    StructField, StructType, TimestampType,
 )
 
-from src.utils.config import AppConfig, DEFAULT_CONFIG
+from src.utils.config import AppConfig
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-
 # ---------------------------------------------------------------------------
-# Bronze EEG file registry schema
+# Bronze schema definitions
 # ---------------------------------------------------------------------------
 
-BRONZE_EEG_SCHEMA = StructType([
-    StructField("file_path",        StringType(),    nullable=False),
-    StructField("file_name",        StringType(),    nullable=False),
-    StructField("file_size_bytes",  LongType(),      nullable=True),
-    StructField("modification_time",TimestampType(), nullable=True),
-    # Parsed from filename (e.g. SC4001E0-PSG.edf)
-    StructField("subject_id",       StringType(),    nullable=False),
-    StructField("study_type",       StringType(),    nullable=True),  # SC or ST
-    StructField("session_id",       StringType(),    nullable=True),  # E0, E1
-    StructField("is_hypnogram",     BooleanType(),   nullable=False),
-    StructField("ingestion_date",   TimestampType(), nullable=False),
+# Schema for the raw EDF file registry (Bronze)
+# Note: _metadata is a special Auto Loader column injected automatically
+BRONZE_EDF_SCHEMA = StructType([
+    StructField("subject_id",     StringType(),    nullable=False),
+    StructField("night_index",    IntegerType(),   nullable=True),
+    StructField("file_type",      StringType(),    nullable=False),  # PSG | Hypnogram
+    StructField("file_path",      StringType(),    nullable=False),
+    StructField("file_name",      StringType(),    nullable=False),
+    StructField("file_size_bytes", LongType(),     nullable=True),
+    StructField("dataset_source", StringType(),    nullable=True),   # sleep-edf | cap
+    StructField("ingestion_ts",   TimestampType(), nullable=False),
 ])
 
 
 # ---------------------------------------------------------------------------
-# Filename parsing UDF
+# Helper: parse subject_id and night_index from EDF file name
 # ---------------------------------------------------------------------------
 
-# Regex pattern for Sleep-EDF filenames:
-# SC4001E0-PSG.edf  → groups: study_type=SC, subject_num=4001, session=E0, file_type=PSG
-# SC4001EC-Hypnogram.edf → file_type=Hypnogram
-_SLEEPDF_PATTERN = re.compile(
-    r"^(SC|ST)(\d{4})(E\d|EC)-(PSG|Hypnogram)\.edf$",
-    re.IGNORECASE
-)
+def parse_edf_filename(file_name: str) -> dict:
+    """Extract subject_id, night_index, and file_type from an EDF file name.
 
-
-@F.udf(returnType=StructType([
-    StructField("subject_id",  StringType(), nullable=True),
-    StructField("study_type",  StringType(), nullable=True),
-    StructField("session_id",  StringType(), nullable=True),
-    StructField("is_hypnogram",BooleanType(),nullable=True),
-]))
-def _parse_edf_filename(file_name: str):
-    """Parse Sleep-EDF filename into structured metadata fields.
-
-    Exam note: Python UDFs serialize row-by-row (slower than Pandas UDFs).
-    This is acceptable here because we only call it once during Bronze ingestion
-    (few hundred files), not on millions of signal rows.
+    Sleep-EDF Expanded naming convention:
+    - PSG:       SC4001E0-PSG.edf   → subject_id='SC4001', night_index=0
+    - Hypnogram: SC4001EC-Hypnogram.edf → subject_id='SC4001'
 
     Args:
-        file_name: Raw filename string, e.g. 'SC4001E0-PSG.edf'
+        file_name: Base file name, e.g. 'SC4001E0-PSG.edf'
 
     Returns:
-        StructType with subject_id, study_type, session_id, is_hypnogram
+        Dict with keys: subject_id, night_index, file_type
+
+    Example::
+
+        parse_edf_filename("SC4001E0-PSG.edf")
+        # {'subject_id': 'SC4001', 'night_index': 0, 'file_type': 'PSG'}
     """
-    if file_name is None:
-        return (None, None, None, None)
-    m = _SLEEPDF_PATTERN.match(file_name)
-    if not m:
-        return (None, None, None, None)
-    study_type, subject_num, session_id, file_type = m.groups()
-    subject_id = f"{study_type}{subject_num}"  # e.g. "SC4001"
-    is_hypnogram = (file_type.lower() == "hypnogram")
-    return (subject_id, study_type.upper(), session_id.upper(), is_hypnogram)
+    result = {"subject_id": None, "night_index": None, "file_type": "unknown"}
+
+    # Sleep-EDF cassette/telemetry pattern
+    # SC/ST + 4-digit subject + E + night_digit + optional_char + '-' + type + '.edf'
+    psg_match = re.match(
+        r"([A-Z]{2}\d{4})E(\d)[A-Z]?-PSG\.edf$", file_name, re.IGNORECASE
+    )
+    hyp_match = re.match(
+        r"([A-Z]{2}\d{4})E[0-9A-Z]?-Hypnogram\.edf$", file_name, re.IGNORECASE
+    )
+
+    if psg_match:
+        result["subject_id"] = psg_match.group(1).upper()
+        result["night_index"] = int(psg_match.group(2))
+        result["file_type"] = "PSG"
+    elif hyp_match:
+        result["subject_id"] = hyp_match.group(1).upper()
+        result["file_type"] = "Hypnogram"
+        # night_index for hypnogram is derived from the 'C' character (cassette convention)
+        result["night_index"] = None
+    else:
+        # Generic fallback: try to extract any alphanumeric prefix
+        generic = re.match(r"([A-Z0-9]{4,8})", file_name, re.IGNORECASE)
+        if generic:
+            result["subject_id"] = generic.group(1).upper()
+
+    return result
+
+
+# Spark UDF version of parse_edf_filename for use in DataFrames
+_parse_filename_udf = F.udf(
+    lambda fname: parse_edf_filename(fname)["subject_id"],
+    StringType(),
+)
+_parse_night_udf = F.udf(
+    lambda fname: parse_edf_filename(fname)["night_index"],
+    IntegerType(),
+)
+_parse_type_udf = F.udf(
+    lambda fname: parse_edf_filename(fname)["file_type"],
+    StringType(),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -105,169 +125,146 @@ def _parse_edf_filename(file_name: str):
 def load_raw_files(
     spark: SparkSession,
     source_path: str,
-    cfg: AppConfig = DEFAULT_CONFIG,
+    use_autoloader: bool = True,
+    checkpoint_path: Optional[str] = None,
+    schema_location: Optional[str] = None,
 ) -> DataFrame:
-    """Load EDF file metadata from a directory using Auto Loader (streaming).
+    """Load raw EDF files from a directory into a streaming/batch DataFrame.
 
-    This returns a STREAMING DataFrame. Use `.writeStream` to sink it,
-    or `.display()` / `.show()` is not supported on streaming DataFrames directly.
+    Uses Databricks Auto Loader (cloudFiles) when available for incremental,
+    exactly-once ingestion with automatic schema inference and evolution.
 
-    Auto Loader exam key points:
-    - `cloudFiles.format`: inner format of the files (here: `binaryFile` for EDF)
-    - `cloudFiles.schemaLocation`: persists inferred schema to avoid re-scanning
-    - `cloudFiles.inferColumnTypes`: infer types from file metadata columns
-    - `recursiveFileLookup`: traverse subdirectories
+    Auto Loader key concepts (exam):
+    - ``format("cloudFiles")`` enables Auto Loader
+    - ``cloudFiles.format`` = inner file format (binaryFile for EDF)
+    - ``cloudFiles.schemaLocation`` = persistent path to store inferred schema
+    - ``cloudFiles.inferColumnTypes`` = derive types from content
+    - Checkpoint location = tracks which files were already processed
 
     Args:
         spark: Active SparkSession.
-        source_path: Path to directory containing EDF files
-                     (UC Volume path on Databricks, local path in tests).
-        cfg: Application configuration.
+        source_path: Directory containing EDF files.
+        use_autoloader: Use Auto Loader (True) or plain spark.read (False).
+        checkpoint_path: Cloud path for Auto Loader checkpoints.
+        schema_location: Cloud path for Auto Loader schema storage.
 
     Returns:
-        Streaming DataFrame with Auto Loader file metadata columns:
-        path, name, length, modificationTime, content (binary).
+        A streaming DataFrame (Auto Loader) or batch DataFrame (plain read).
+        Columns: path, name, length, modificationTime, content (binary).
     """
-    log.info(f"Loading raw EDF files from: {source_path}")
+    if use_autoloader:
+        log.info("Starting Auto Loader ingestion", source=source_path)
+        reader = (
+            spark.readStream
+            .format("cloudFiles")
+            .option("cloudFiles.format", "binaryFile")   # EDF = binary
+            .option("pathGlobFilter", "*.edf")           # Only EDF files
+            .option("recursiveFileLookup", "true")        # Scan subdirectories
+        )
+        if schema_location:
+            reader = reader.option("cloudFiles.schemaLocation", schema_location)
+        if checkpoint_path:
+            # checkpoint is set on writeStream, not readStream
+            # storing here for reference when building the write stream
+            reader = reader.option("_checkpointLocation", checkpoint_path)
+        return reader.load(source_path)
+    else:
+        # Batch fallback for local development / unit tests
+        log.info("Loading EDF files (batch mode)", source=source_path)
+        return (
+            spark.read
+            .format("binaryFile")
+            .option("pathGlobFilter", "*.edf")
+            .option("recursiveFileLookup", "true")
+            .load(source_path)
+        )
 
-    return (
-        spark.readStream
-        .format("cloudFiles")
-        .option("cloudFiles.format", "binaryFile")  # EDF files are binary
-        .option("cloudFiles.schemaLocation", cfg.paths.autoloader_schema_location)
-        .option("cloudFiles.inferColumnTypes", "true")
-        .option("recursiveFileLookup", "true")
-        .option("pathGlobFilter", "*.edf")           # Only EDF files
-        .load(source_path)
-    )
 
+def enrich_bronze_df(df: DataFrame) -> DataFrame:
+    """Add derived columns (subject_id, night_index, file_type) to raw file DataFrame.
 
-def load_raw_files_batch(
-    spark: SparkSession,
-    source_path: str,
-) -> DataFrame:
-    """Batch (non-streaming) version of load_raw_files for local testing and notebooks.
-
-    Exam note: COPY INTO is the batch equivalent of Auto Loader for one-time loads.
-    Auto Loader is preferred for continuous/incremental scenarios.
-    Use this function when Auto Loader is not available (local dev, unit tests).
+    This transformation extracts structured metadata from the file name,
+    turning the raw binaryFile row into a proper Bronze schema record.
 
     Args:
-        spark: Active SparkSession.
-        source_path: Path to directory containing EDF files.
+        df: Raw DataFrame from load_raw_files() with columns:
+            path, name, length, modificationTime
 
     Returns:
-        Batch DataFrame with file metadata columns.
+        DataFrame matching BRONZE_EDF_SCHEMA (minus content binary for storage).
     """
-    log.info(f"[BATCH] Loading EDF file metadata from: {source_path}")
-    return (
-        spark.read
-        .format("binaryFile")
-        .option("recursiveFileLookup", "true")
-        .option("pathGlobFilter", "*.edf")
-        .load(source_path)
-    )
-
-
-def transform_file_metadata(df_raw: DataFrame) -> DataFrame:
-    """Transform raw Auto Loader output into the Bronze EEG file registry schema.
-
-    Steps:
-    1. Extract filename from path.
-    2. Apply `_parse_edf_filename` UDF to get subject_id, study_type, etc.
-    3. Add ingestion timestamp.
-    4. Select final Bronze schema columns.
-
-    Args:
-        df_raw: Raw DataFrame from Auto Loader (streaming or batch).
-
-    Returns:
-        Transformed DataFrame matching BRONZE_EEG_SCHEMA.
-    """
-    # Extract file name from full path (works for both local and cloud paths)
-    df = df_raw.withColumn(
-        "file_name", F.element_at(F.split(F.col("path"), "/"), -1)
-    )
-
-    # Parse filename into structured fields
-    df = df.withColumn("parsed", _parse_edf_filename(F.col("file_name")))
-
-    # Flatten the struct columns
-    df = (
-        df
-        .withColumn("subject_id",   F.col("parsed.subject_id"))
-        .withColumn("study_type",   F.col("parsed.study_type"))
-        .withColumn("session_id",   F.col("parsed.session_id"))
-        .withColumn("is_hypnogram", F.col("parsed.is_hypnogram"))
-        .withColumn("ingestion_date", F.current_timestamp())
-    )
-
-    # Rename Auto Loader columns to match Bronze schema
     return df.select(
+        _parse_filename_udf(F.col("name")).alias("subject_id"),
+        _parse_night_udf(F.col("name")).alias("night_index"),
+        _parse_type_udf(F.col("name")).alias("file_type"),
         F.col("path").alias("file_path"),
-        F.col("file_name"),
+        F.col("name").alias("file_name"),
         F.col("length").alias("file_size_bytes"),
-        F.col("modificationTime").alias("modification_time"),
-        F.col("subject_id"),
-        F.col("study_type"),
-        F.col("session_id"),
-        F.col("is_hypnogram"),
-        F.col("ingestion_date"),
+        F.lit("sleep-edf").alias("dataset_source"),
+        F.current_timestamp().alias("ingestion_ts"),
     )
 
 
 def create_bronze_table(
     spark: SparkSession,
-    source_path: str,
-    cfg: AppConfig = DEFAULT_CONFIG,
+    cfg: AppConfig,
     trigger_once: bool = True,
 ) -> None:
-    """Create or update the Bronze EEG file registry Delta table using Auto Loader.
+    """Create or update the Bronze EDF file registry table using Auto Loader.
 
-    This is the main entry point for Bronze ingestion. It writes a streaming query
-    that:
-    - Reads new EDF files from source_path via Auto Loader
-    - Transforms metadata via transform_file_metadata()
-    - Writes incrementally to the Bronze Delta table
-    - Stores checkpoint so re-runs are idempotent
+    Writes a streaming query from the EDF source directory to the Bronze
+    Delta table. Using ``trigger(availableNow=True)`` (equivalent to
+    trigger-once in newer Spark) processes all available files and stops.
 
-    Exam note on trigger types:
-    - `availableNow` (Databricks recommended): processes all available data then stops.
-      Equivalent to `once=True` but more efficient (multiple micro-batches).
-    - `once=True`: one micro-batch, then stops. Legacy.
-    - `processingTime='30 seconds'`: continuous micro-batch mode.
-    - `continuous='1 second'`: low-latency continuous mode (experimental).
+    Exam note: ``trigger(availableNow=True)`` is the modern replacement
+    for ``trigger(once=True)``. Both process all backlog files then stop.
+    Use ``trigger(processingTime='10 minutes')`` for continuous micro-batch.
 
     Args:
         spark: Active SparkSession.
-        source_path: Source directory with EDF files.
         cfg: Application configuration.
-        trigger_once: If True, use availableNow trigger (batch-style). 
-                      If False, run continuously.
+        trigger_once: If True, use availableNow trigger (process all + stop).
     """
-    target_table = cfg.catalog.bronze_edf_fqn
+    source_path = cfg.paths.edf_source_path
     checkpoint = cfg.paths.autoloader_checkpoint
+    schema_loc = cfg.paths.autoloader_schema_location
+    table_name = cfg.catalog.bronze_edf_fqn
 
-    log.info(f"Starting Bronze ingestion: {source_path} → {target_table}")
+    log.info("Creating Bronze table", table=table_name, source=source_path)
 
-    df_raw = load_raw_files(spark, source_path, cfg)
-    df_bronze = transform_file_metadata(df_raw)
+    raw_df = load_raw_files(
+        spark,
+        source_path,
+        use_autoloader=True,
+        checkpoint_path=checkpoint,
+        schema_location=schema_loc,
+    )
+    bronze_df = enrich_bronze_df(raw_df)
 
-    writer = (
-        df_bronze.writeStream
+    write_query = (
+        bronze_df.writeStream
         .format("delta")
-        .outputMode("append")           # Only new files appended
+        .outputMode("append")          # Append-only for Bronze (immutable raw data)
         .option("checkpointLocation", checkpoint)
-        .option("mergeSchema", "true")  # Allow schema evolution
+        .option(
+            "mergeSchema", "true",     # Allow schema evolution without failing
+        )
     )
 
-    if trigger_once:
-        # availableNow: process all pending files, then stop
-        # Exam: preferred trigger for scheduled jobs (cost-efficient)
-        query = writer.trigger(availableNow=True).toTable(target_table)
+    if table_name.count(".") == 2:     # Unity Catalog FQN (catalog.schema.table)
+        write_query = write_query.toTable(table_name)
     else:
-        # Continuous: keep running for real-time ingestion
-        query = writer.trigger(processingTime="30 seconds").toTable(target_table)
+        write_query = write_query.start(table_name)  # Path-based fallback
 
-    query.awaitTermination()
-    log.info(f"Bronze ingestion complete. Table: {target_table}")
+    if trigger_once:
+        # availableNow=True: process all queued files, then terminate
+        query = (
+            bronze_df.writeStream
+            .format("delta")
+            .outputMode("append")
+            .option("checkpointLocation", checkpoint)
+            .trigger(availableNow=True)
+            .toTable(table_name)
+        )
+        query.awaitTermination()
+        log.info("Bronze ingestion complete", table=table_name)

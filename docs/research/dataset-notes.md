@@ -1,98 +1,127 @@
-# Dataset Notes — Sleep EEG Corpora
+# EEG Dataset Notes
 
 ## Primary Dataset: Sleep-EDF Expanded (PhysioNet)
 
-- **URL:** https://physionet.org/content/sleep-edfx/1.0.0/
-- **Subjects:** 197 (SC: 153 healthy, ST: 44 with temazepam)
-- **Nights:** 1–2 per subject → ~350 PSG recordings total
-- **Format:** EDF (European Data Format) — binary, header + signal records
-- **EEG channels:** `EEG Fpz-Cz`, `EEG Pz-Oz` (2 channels, 100 Hz)
-- **Additional signals:** EOG horizontal (100 Hz), EMG submental (1 Hz), rectal body temperature (1 Hz)
-- **Annotations:** EDF+ annotation file (.edf-Hypnogram) — 30-sec epochs, labels: W/1/2/3/4/R/M (wake/NREM stages/REM/movement)
-- **Total uncompressed size:** ~8 GB
+**Citation:** Kemp et al. (2000), Goldberger et al. (2000)  
+**URL:** https://physionet.org/content/sleep-edfx/1.0.0/  
+**License:** PhysioNet Restricted Health Data License 1.5.0 (free for research)
 
-### Key EDF Header Fields (mapped to Bronze schema)
+### Structure
 ```
-local_patient_id   → subject_id (extract SC/ST prefix + numeric ID)
-startdate          → recording_date
-starttime          → recording_start_time
-number_of_signals  → channel_count
-signal_labels      → channels (list)
-sampling_frequencies → sample_rates (per channel)
+sleep-edf-expanded/
+  sleep-cassette/         # 153 subjects, 2 nights each (SC4*)
+    SC4001E0-PSG.edf      # PSG (polysomnography) recording
+    SC4001EC-Hypnogram.edf  # Sleep stage annotations
+  sleep-telemetry/        # 44 subjects, 1-2 nights (ST7*)
+    ST7011J0-PSG.edf
+    ST7011JP-Hypnogram.edf
 ```
 
-### File Naming Convention
-```
-SC4001E0-PSG.edf   → SC (Study Cassette), subject 4001, E0 (evening 0)
-SC4001EC-Hypnogram.edf  → corresponding annotation file
-```
+### Key EDF Fields
+| Field | Value | Notes |
+|-------|-------|-------|
+| EEG channels | Fpz-Cz, Pz-Oz | 2 EEG channels (standard in cassette subset) |
+| EOG channel | ROC-LOC | Used for artifact detection |
+| EMG channel | EMG submental | Chin EMG for sleep staging |
+| Sampling rate | 100 Hz | All EEG/EOG channels |
+| EMG sample rate | 1 Hz | Submental only |
+| Recording duration | ~8 hours per night | Variable |
+| Annotation format | EDF+C | Sleep stages: W, 1, 2, 3, 4, R, M, ? |
+
+### Subject Metadata (from header)
+| Field | Example | Notes |
+|-------|---------|-------|
+| subject_id | SC4001 | 6-char code: prefix + 4-digit ID |
+| night | E0, E1 | Night index (0=first, 1=second) |
+| recording_date | 1989-04-03 | From EDF header |
+| age | 25 | From ST subset only (not SC) |
+
+### Volume Estimate
+- Total subjects: 197 (153 SC + 44 ST)
+- Files per subject: 2 (PSG + Hypnogram) × 1-2 nights = ~2-4 EDF files
+- Single EDF size: ~130 MB (8h × 2 channels × 100 Hz × 2 bytes)
+- **Total estimated size: ~60 GB** for full corpus
+- Pilot cohort (5 subjects, 10 EDF files): ~650 MB
 
 ### Download Commands
 ```bash
-# Install PhysioNet downloader
+# Requires PhysioNet credentialing + wget
+wget -r -N -c -np https://physionet.org/files/sleep-edfx/1.0.0/ -P /tmp/sleep-edf
+
+# Or use wfdb Python package
 pip install wfdb
+# python -c "import wfdb; wfdb.dl_database('sleep-edfx', '/tmp/sleep-edf')"
 
-# Download first 5 subjects for pilot (SC40xx)
-wget -r -N -c -np https://physionet.org/files/sleep-edfx/1.0.0/ \
-  --accept "SC40*" -P /tmp/sleep-edf/
-
-# Or use wfdb Python API
-python -c "
-import wfdb
-wfdb.dl_database('sleep-edfx', '/tmp/sleep-edf/', records=['SC4001E0-PSG'])
-"
+# For pilot: download only SC4001 and SC4002 (2 subjects)
+wget https://physionet.org/files/sleep-edfx/1.0.0/sleep-cassette/SC4001E0-PSG.edf
+wget https://physionet.org/files/sleep-edfx/1.0.0/sleep-cassette/SC4001EC-Hypnogram.edf
 ```
 
 ---
 
 ## Validation Dataset: CAP Sleep Database (PhysioNet)
 
-- **URL:** https://physionet.org/content/capslpdb/1.0.0/
-- **Subjects:** 108 (16 healthy, 22 REM Behavior Disorder, 10 periodic leg movements, ...)
-- **Format:** EDF + EDF+ annotations
-- **EEG channels:** 3–19 (varies per subject — requires channel harmonization)
-- **Sampling rate:** 512 Hz → must downsample to 100 Hz for consistency with Sleep-EDF
-- **Size:** ~3 GB
+**URL:** https://physionet.org/content/capslpdb/1.0.0/  
+**N:** 108 subjects (16 normal + 92 with various sleep disorders)  
+**EEG channels:** 3-19 (variable per subject)  
+**Sampling rate:** 512 Hz → must downsample to 100 Hz for consistency with Sleep-EDF
 
 ---
 
-## Volume Estimates for Databricks Planning
+## Bronze Schema Design
 
-| Layer | Table | Format | Estimated Size | Notes |
-|-------|-------|--------|----------------|-------|
-| Bronze | `raw_eeg_files` | Delta (binary metadata) | ~50 MB | File paths + headers, not raw signals |
-| Bronze | Actual EDF binaries | Volume (unstructured) | ~8 GB | Stored in UC Volume |
-| Silver | `cleaned_epochs` | Delta (float arrays) | ~15 GB | 30-sec epochs, 100 Hz, 2 channels |
-| Silver | `spindle_events` | Delta (structs) | ~200 MB | ~10–30 spindles/subject/night |
-| Silver | `slow_oscillation_events` | Delta (structs) | ~100 MB | ~100–300 SOs/subject/night |
-| Silver | `pac_windows` | Delta (float arrays) | ~2 GB | 5-sec windows around events |
-| Gold | `tda_features` | Delta (float columns) | ~500 MB | Betti curves, landscapes, TMCI per window |
-| Gold | `ml_ready_features` | Delta (wide table) | ~50 MB | One row per subject/night |
-
-**Cluster sizing recommendation:**
-- Pilot (5 subjects): Single-node `Standard_DS3_v2` (14 GB RAM) is sufficient
-- Full cohort (197 subjects): 2–4 worker `Standard_DS4_v2` cluster; Ripser TDA computation is the bottleneck
-
----
-
-## Memory Proxy Derivation
-
-Since behavioral memory task scores are unavailable in Sleep-EDF, we use four EEG-validated proxies:
+### Table: `eeg_lakehouse.bronze.raw_eeg_files`
+Registers every EDF file ingested. One row per file.
 
 ```python
-# 1. Spindle density (spindles/minute in N2+N3)
-spindle_density = spindle_count_n2_n3 / total_n2_n3_minutes
-
-# 2. SO-spindle PAC modulation index (Tort et al. 2010)
-pac_mi = tort_modulation_index(so_phase_signal, spindle_amplitude_signal)
-
-# 3. Sigma band power (11-16 Hz during N2)
-sigma_power = bandpower(eeg_signal, sf=100, band=(11, 16), hypno=hypno, include_stage=2)
-
-# 4. Sleep quality composite
-quality_score = (
-    0.4 * (n3_percent / 25)       # N3 target: 25% of TST
-  + 0.3 * (sleep_efficiency / 100) # SE target: 100%
-  + 0.3 * (1 - waso_minutes / 60)  # WASO target: 0 min
-)
+BRONZE_EDF_SCHEMA = StructType([
+    StructField("subject_id",    StringType(),    nullable=False),  # e.g. "SC4001"
+    StructField("night_index",   IntegerType(),   nullable=True),   # 0 or 1
+    StructField("file_type",     StringType(),    nullable=False),  # "PSG" or "Hypnogram"
+    StructField("file_path",     StringType(),    nullable=False),  # source path
+    StructField("file_name",     StringType(),    nullable=False),  # basename
+    StructField("file_size_bytes",LongType(),     nullable=True),
+    StructField("ingestion_ts",  TimestampType(), nullable=False),  # Auto Loader time
+    StructField("source",        StringType(),    nullable=True),   # "sleep-edf" | "cap"
+    # Auto Loader metadata columns (injected by cloudFiles)
+    StructField("_metadata",     StructType([
+        StructField("file_path",         StringType(), True),
+        StructField("file_name",         StringType(), True),
+        StructField("file_size",         LongType(),   True),
+        StructField("file_modification_time", TimestampType(), True),
+    ]), nullable=True),
+])
 ```
+
+### Table: `eeg_lakehouse.bronze.subject_metadata`
+One row per subject (parsed from file names + any external CSV).
+
+```python
+BRONZE_METADATA_SCHEMA = StructType([
+    StructField("subject_id",   StringType(),  nullable=False),
+    StructField("dataset",      StringType(),  nullable=False),  # "SC" | "ST"
+    StructField("n_nights",     IntegerType(), nullable=True),
+    StructField("has_psg",      BooleanType(), nullable=True),
+    StructField("has_hypnogram",BooleanType(), nullable=True),
+    StructField("notes",        StringType(),  nullable=True),
+])
+```
+
+---
+
+## EEG Signal Characteristics (for UDF design)
+
+| Oscillation | Frequency Band | Duration | Amplitude |
+|------------|----------------|----------|-----------|
+| Slow Oscillation (SO) | 0.5–1.0 Hz | 0.5–2 sec | >75 µV peak-to-peak |
+| Sleep Spindle | 11–16 Hz | 0.5–3 sec | varies |
+| K-complex | <3.5 Hz | >0.5 sec | >75 µV |
+| Ripple (hippocampal) | 80–120 Hz | 40–100 ms | low amplitude |
+
+## Auto Loader Notes (Exam Relevant)
+
+- **`format("cloudFiles")`** is the Databricks Auto Loader format string
+- **`cloudFiles.format`** = inner file format (here: `binaryFile` for raw EDF, or `csv` for metadata)
+- **Schema location** must be a persistent cloud path (DBFS or Volume) — stores inferred schema across runs
+- **Checkpoint location** tracks which files have been processed — guarantees exactly-once ingestion
+- EDF files are binary → use `binaryFile` source; extract metadata from file names via UDF
