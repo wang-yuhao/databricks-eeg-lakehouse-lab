@@ -84,6 +84,7 @@ databricks-eeg-lakehouse-lab/
     ├── study-notes/          # 14 daily exam study notes
     ├── exam/                 # Deep-dive exam reference docs
     └── research/             # EEG neuroscience background
+    ├── DATASET-INTEGRATION-GUIDE.md  # PhysioNet Sleep-EDF dataset integration guide
 ```
 
 ---
@@ -122,6 +123,8 @@ pytest tests/ -v
 
 **Project overview:** [`docs/project-overview.md`](docs/project-overview.md)
 
+**Dataset integration:** [`docs/research/DATASET-INTEGRATION-GUIDE.md`](docs/research/DATASET-INTEGRATION-GUIDE.md)
+
 ---
 
 ## Technology Stack
@@ -146,3 +149,24 @@ Databricks Asset Bundles · pytest · Python 3.11
 
 *Built as a 14-day intensive study programme combining exam preparation with
 production data engineering on real sleep EEG research data.*
+
+---
+
+## Research Dataset
+
+This project uses the **PhysioNet Sleep-EDF Expanded** dataset, a comprehensive collection of polysomnographic sleep recordings. The dataset includes EEG, EOG, and EMG signals from 200 subjects, making it ideal for developing production-scale data pipelines and ML-based sleep analysis.
+
+**Key features:**
+- 200 subjects with full-night sleep recordings
+- Multiple EEG channels (Fpz-Cz, Pz-Oz)
+- Expert-annotated sleep stages (W, N1, N2, N3, REM)
+- Sampling rate: 100 Hz
+- Format: European Data Format (EDF)
+
+For detailed information on dataset download, schema design, and integration into the Databricks lakehouse, see [`docs/research/DATASET-INTEGRATION-GUIDE.md`](docs/research/DATASET-INTEGRATION-GUIDE.md).
+
+---
+
+## License
+
+MIT License - see LICENSE file for details
