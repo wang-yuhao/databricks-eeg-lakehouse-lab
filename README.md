@@ -131,7 +131,7 @@ databricks-eeg-lakehouse-lab/
 | [18](docs/study-notes/day18-dataset-integration.md) | PhysioNet Dataset Integration | Real EDF pipeline, production ingestion |
 | [19](docs/study-notes/day19-security-compliance.md) | Security & Compliance | Row-level security, audit logging |
 | [20](docs/study-notes/day20-databricks-cli-api.md) | Databricks CLI & API Automation | CLI commands, REST API, deployment |
-| [21](docs/study-notes/day21-data-modeling.md) | Advanced Data Modeling & TDA | Dimensional modeling, Persistent Homology |
+| [21](notebooks/21_end_to_end_pipeline.py) | End-to-End Pipeline Integration | Delta Live Tables, Production deployment, Orchestration |
 
 ---
 
