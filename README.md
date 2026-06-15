@@ -124,6 +124,8 @@ databricks-eeg-lakehouse-lab/
 | Day | Topic | Key Exam Domain |
 |---|---|---|
 | [15](docs/study-notes/day15-data-source-connectors.md) | Data Source Connectors | JDBC, Cloud Storage, Streaming, Delta Sharing |
+| [16](docs/study-notes/day16-delta-sharing.md) | Delta Sharing & Federation | Cross-workspace data sharing, BI tool integration, recipient/provider setup |
+| [17](docs/study-notes/day17-monitoring-observability.md) | Monitoring & Observability | Query profiling, Spark UI metrics, data quality checks, cost monitoring |
 | [16](docs/study-notes/day16-delta-sharing.md) | Delta Sharing & Federation | Cross-workspace sharing, BI integration |
 | [17](docs/study-notes/day17-monitoring-observability.md) | Monitoring & Observability | Query profiling, skew, memory optimization |
 | [18](docs/study-notes/day18-dataset-integration.md) | PhysioNet Dataset Integration | Real EDF pipeline, production ingestion |
