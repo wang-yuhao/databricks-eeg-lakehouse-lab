@@ -101,7 +101,7 @@ PhysioNet / WFDB API
 3. Fill in:
    - **Subscription**: select your subscription
    - **Resource group name**: `rg-eeg-lakehouse-prod`
-   - **Region**: `West Europe` (or your preferred region — keep all resources in the same region)
+   - **Region**: `Germany West Central` (or your preferred region — keep all resources in the same region)
 4. Click **"Review + create"** → **"Create"**.
 
 ### 1.2 Via Azure Cloud Shell (Faster)
@@ -112,7 +112,7 @@ Open Cloud Shell at [shell.azure.com](https://shell.azure.com) or via the Portal
 # In Cloud Shell (Bash mode) — authentication is automatic
 az group create \
   --name rg-eeg-lakehouse-prod \
-  --location westeurope
+  --location germanywestcentral
 ```
 
 **Expected result**: `"provisioningState": "Succeeded"`
@@ -139,7 +139,7 @@ az group create \
 az storage account create \
   --name steeglakehouse \
   --resource-group rg-eeg-lakehouse-prod \
-  --location westeurope \
+  --location germanywestcentral \
   --sku Standard_LRS \
   --kind StorageV2 \
   --enable-hierarchical-namespace true \
@@ -193,7 +193,7 @@ In 2026, the **recommended authentication method** for Databricks→Storage acce
 #### Via Azure Portal
 
 1. Search **"Access connectors for Azure Databricks"** → **"+ Create"**.
-2. Select resource group `rg-eeg-lakehouse-prod`, name it `ac-eeg-lakehouse`, region `West Europe`.
+2. Select resource group `rg-eeg-lakehouse-prod`, name it `ac-eeg-lakehouse`, region `Germany West Central`.
 3. Under **Identity**, select **System assigned** managed identity.
 4. Click **"Review + create"** → **"Create"**.
 
@@ -204,7 +204,7 @@ In 2026, the **recommended authentication method** for Databricks→Storage acce
 az databricks access-connector create \
   --name ac-eeg-lakehouse \
   --resource-group rg-eeg-lakehouse-prod \
-  --location westeurope \
+  --location germanywestcentral \
   --identity-type SystemAssigned
 ```
 
@@ -282,7 +282,7 @@ echo "sp-credentials.json" >> .gitignore
 #### Via Azure Portal
 
 1. Search **"Azure Databricks"** → **"+ Create"**.
-2. Select resource group `rg-eeg-lakehouse-prod`, name `dbw-eeg-lakehouse-prod`, region `West Europe`.
+2. Select resource group `rg-eeg-lakehouse-prod`, name `dbw-eeg-lakehouse-prod`, region `Germany West Central`.
 3. **Pricing tier**: **Premium** (required for Unity Catalog, Delta Live Tables, serverless compute).
 4. Under **Networking**: enable **"No Public IP"** (Secure Cluster Connectivity) for security.
 5. Click **"Review + create"** → **"Create"**. Deployment takes 5–10 minutes.
@@ -294,7 +294,7 @@ echo "sp-credentials.json" >> .gitignore
 az databricks workspace create \
   --name dbw-eeg-lakehouse-prod \
   --resource-group rg-eeg-lakehouse-prod \
-  --location westeurope \
+  --location germanywestcentral \
   --sku premium \
   --enable-no-public-ip true
 ```
@@ -332,7 +332,7 @@ echo "Workspace URL: https://$WORKSPACE_URL"
 #### Via Azure Portal
 
 1. Search **"Key vaults"** → **"+ Create"**.
-2. Resource group: `rg-eeg-lakehouse-prod`, name: `kv-eeg-lakehouse`, region: `West Europe`.
+2. Resource group: `rg-eeg-lakehouse-prod`, name: `kv-eeg-lakehouse`, region: `Germany West Central`.
 3. Under **Access configuration**: select **Azure role-based access control (RBAC)**.
 4. Click **"Review + create"** → **"Create"**.
 
@@ -343,7 +343,7 @@ echo "Workspace URL: https://$WORKSPACE_URL"
 az keyvault create \
   --name kv-eeg-lakehouse \
   --resource-group rg-eeg-lakehouse-prod \
-  --location westeurope \
+  --location germanywestcentral \
   --enable-rbac-authorization true
 ```
 
@@ -440,8 +440,8 @@ Navigate to <https://accounts.azuredatabricks.net> → sign in as account admin.
 
 1. In Account Console → **"Data"** → **"Unity Catalog"** → **"Create metastore"**.
 2. Fill in:
-   - **Metastore name**: `eeg-lakehouse-metastore-westeurope`
-   - **Region**: `westeurope`
+   - **Metastore name**: `eeg-lakehouse-metastore-germanywestcentral`
+   - **Region**: `germanywestcentral`
    - **ADLS Gen2 path**: `abfss://unity-catalog@steeglakehouse.dfs.core.windows.net/`
    - **Access connector ID**: paste the Resource ID of `ac-eeg-lakehouse`
 3. Click **"Create"**.
@@ -861,7 +861,7 @@ databricks bundle run eeg_medallion_pipeline --profile eeg-lakehouse
 
 ### Infrastructure
 
-- [ ] Resource group `rg-eeg-lakehouse-prod` created in `westeurope`
+- [ ] Resource group `rg-eeg-lakehouse-prod` created in `germanywestcentral`
 - [ ] Storage account `steeglakehouse` with hierarchical namespace enabled
 - [ ] Five containers: `bronze`, `silver`, `gold`, `checkpoints`, `unity-catalog`
 - [ ] Databricks Access Connector `ac-eeg-lakehouse` with `Storage Blob Data Contributor` role
@@ -999,8 +999,8 @@ For CI/CD environments, switch to M2M OAuth with environment variables (Step 7.3
 
 ---
 
-**Document Version**: 2.1  
+**Document Version**: 2.2  
 **Last Updated**: June 2026  
 **Databricks Runtime**: 16.4 LTS (Spark 3.5)  
 **Maintainer**: EEG Lakehouse Project Team  
-**Key change from v2.0**: All Azure CLI sections updated to use Azure Cloud Shell (pre-authenticated, no `az login`), with Azure Portal GUI alternatives added throughout. Databricks CLI authentication updated to OAuth U2M/M2M (v0.230+).
+**Key changes from v2.0**: All Azure CLI sections updated to use Azure Cloud Shell (pre-authenticated, no `az login`), with Azure Portal GUI alternatives added throughout. Databricks CLI authentication updated to OAuth U2M/M2M (v0.230+). Region changed from `westeurope` to `germanywestcentral` (Frankfurt) — the only German region supported by Azure Databricks, and the closest data center to Munich.
