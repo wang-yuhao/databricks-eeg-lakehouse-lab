@@ -1,941 +1,852 @@
-# Day 10: Machine Learning and Advanced Analytics
+# Day 10: Machine Learning with MLflow, Feature Store, and Model Registry
 
-## Objective
-Implement end-to-end machine learning pipelines for EEG data, including feature engineering, model training, experiment tracking with MLflow, and model deployment.
-
----
-
-## Prerequisites
-
-### Completed Tasks
-- Gold layer feature tables created (Day 6)
-- Data quality monitoring implemented (Day 9)
-- Unity Catalog configured (if using Premium)
-
-### Required Knowledge
-- Machine learning fundamentals
-- MLflow for experiment tracking and model registry
-- PySpark ML and scikit-learn
-- Feature engineering techniques
+| Field | Value |
+|---|---|
+| **Notebook** | `notebooks/day10_ml_pipeline.py` |
+| **Exam domains** | Domain 2 — ELT with Apache Spark; Domain 5 — ML with Databricks |
+| **Time estimate** | 5–6 hours |
+| **Prerequisite** | Days 1–9 completed; Gold layer `eeg_lakehouse.gold.eeg_features` table exists; DLT pipeline has run at least once |
 
 ---
 
-## Part 1: Advanced Feature Engineering
+## Section 1: Environment Setup
 
-### 1.1 Create ML Feature Store
+Complete every step in this section before opening any notebook cell. A reader starting from a blank Databricks workspace must follow these steps in order.
+
+### 1.1 Create a GitHub Personal Access Token
+
+1. Sign in to [github.com](https://github.com).
+2. Navigate to **Settings** → **Developer settings** → **Personal access tokens** → **Tokens (classic)**.
+3. Click **Generate new token (classic)**.
+4. Configure the token:
+
+   | Field | Value |
+   |---|---|
+   | Note | `databricks-eeg-lab` |
+   | Expiration | 90 days |
+   | Scopes | `repo` (full), `workflow` |
+
+5. Copy the token immediately and store it in a password manager. It will not be displayed again.
+
+### 1.2 Configure Databricks Git Integration
+
+1. Click your username in the top-right corner of the workspace and select **User Settings**.
+2. Select the **Git integration** tab.
+3. Enter the following:
+
+   | Field | Value |
+   |---|---|
+   | Git provider | GitHub |
+   | Git provider username | Your GitHub username |
+   | Personal access token | Token from step 1.1 |
+
+4. Click **Save**.
+
+### 1.3 Clone the Repository into Databricks Repos
+
+1. In the left sidebar, click **Repos**.
+2. Click **Add repo**.
+3. Fill in the fields:
+
+   | Field | Value |
+   |---|---|
+   | Git repository URL | `https://github.com/wang-yuhao/databricks-eeg-lakehouse-lab` |
+   | Git provider | GitHub |
+   | Repo name | `databricks-eeg-lakehouse-lab` |
+
+4. Click **Create repo**.
+
+### 1.4 Create a Cluster with Unity Catalog Enabled
+
+1. In the left sidebar, click **Compute** → **Create compute**.
+2. Apply the following configuration:
+
+   | Setting | Value |
+   |---|---|
+   | Cluster name | `eeg-lab-day10` |
+   | Cluster mode | Single node |
+   | Databricks Runtime | **14.3 LTS ML** (includes MLflow, scikit-learn, XGBoost) |
+   | Node type | `i3.xlarge` (AWS) or `Standard_DS4_v2` (Azure) |
+   | Terminate after | 60 minutes of inactivity |
+   | Unity Catalog | Enabled (access mode: Single user) |
+
+   > Use the **14.3 LTS ML** runtime, not the standard 14.3 LTS. The ML variant pre-installs MLflow, scikit-learn, XGBoost, LightGBM, and PyTorch, eliminating manual library installation.
+
+3. Click **Create compute** and wait for the cluster to reach the **Running** state.
+
+### 1.5 Install Required Libraries
+
+The 14.3 LTS ML runtime includes all required packages. Verify availability in Cell 1 of the notebook. No additional `%pip install` commands are needed unless the Feature Store client is absent.
+
+If the Feature Store client import fails, install it once:
 
 ```python
-from databricks import feature_store
-from pyspark.sql.functions import *
+# Run only if "from databricks import feature_store" raises ModuleNotFoundError
+%pip install databricks-feature-store==0.17.0
+dbutils.library.restartPython()
+```
 
-# Initialize Feature Store client
+### 1.6 Open and Attach the Notebook
+
+1. In the left sidebar, click **Repos** → `databricks-eeg-lakehouse-lab` → `notebooks`.
+2. Click `day10_ml_pipeline.py` to open it.
+3. Click **Connect** in the top-right and select `eeg-lab-day10`.
+4. Confirm the cluster name appears in the toolbar before running any cell.
+
+---
+
+## Section 2: Learning Objectives
+
+| Objective | Exam domain mapping |
+|---|---|
+| Create and write to a Databricks Feature Store table | Domain 5 — ML with Databricks |
+| Engineer time-domain and frequency-domain EEG features | Domain 2 — ELT with Apache Spark |
+| Configure and use MLflow experiments and autologging | Domain 5 — MLflow tracking |
+| Train multiple classifiers and compare runs in the MLflow UI | Domain 5 — Experiment tracking |
+| Register, version, and promote models via the Model Registry | Domain 5 — Model Registry |
+| Perform batch inference against a registered production model | Domain 5 — Model deployment |
+| Implement prediction distribution monitoring | Domain 5 — Model monitoring |
+
+---
+
+## Section 3: Background
+
+### MLflow Components
+
+| Component | Purpose | Databricks integration |
+|---|---|---|
+| Tracking server | Records parameters, metrics, and artifacts for every run | Managed automatically; persists in the workspace |
+| Experiments | Groups runs for one logical project | Created via `mlflow.set_experiment()` or the UI |
+| Model Registry | Centralized versioned model store with lifecycle stages | Accessible via `MlflowClient` or UI |
+| Autologging | Automatically captures hyperparameters, metrics, and model artifacts | `mlflow.<flavor>.autolog()` |
+| `pyfunc` flavor | Generic model wrapper enabling framework-agnostic serving | `mlflow.pyfunc.load_model()` |
+
+### Model Registry Lifecycle Stages
+
+| Stage | Description | Promotion trigger |
+|---|---|---|
+| `None` | Model version registered but unreviewed | Automatic after `mlflow.register_model()` |
+| `Staging` | Validated on hold-out data; ready for acceptance | Manual or programmatic via `MlflowClient` |
+| `Production` | Serving live inference traffic | Passed validation gate (F1 ≥ threshold) |
+| `Archived` | Superseded by a newer version | Auto-archived when a new version enters the same stage |
+
+### Feature Store Architecture
+
+| Concept | Detail |
+|---|---|
+| Feature table | A Delta table registered in the Feature Store with declared primary keys |
+| `FeatureLookup` | Declares how training data is enriched from a feature table at training time |
+| Training set | A `TrainingSet` object that joins labels with feature lookups for consistent offline training |
+| Point-in-time lookup | Time-travel joins to prevent label leakage in time-series datasets |
+
+---
+
+## Section 4: Part 1 — Catalog and Schema Preparation
+
+### Step 1 — Initialise Schemas
+
+```python
+# Cell 1: create required schemas and verify prerequisites
+from pyspark.sql import functions as F
+
+spark.sql("CREATE SCHEMA IF NOT EXISTS eeg_lakehouse.ml_features COMMENT 'Feature Store tables for EEG ML workloads'")
+spark.sql("CREATE SCHEMA IF NOT EXISTS eeg_lakehouse.ml_predictions COMMENT 'Batch inference output tables'")
+
+# Verify the Gold source table exists
+row_count = spark.table("eeg_lakehouse.gold.eeg_features").count()
+print(f"Source Gold table row count: {row_count:,}")
+assert row_count > 0, "eeg_lakehouse.gold.eeg_features is empty. Complete Day 6 before proceeding."
+print("Prerequisites verified.")
+```
+
+---
+
+## Section 5: Part 2 — Feature Engineering
+
+### Step 2 — Load and Engineer Features
+
+```python
+# Cell 2: load Gold layer and compute ML-ready features
+from pyspark.sql import Window
+from pyspark.sql import functions as F
+
+raw_df = spark.table("eeg_lakehouse.gold.eeg_features")
+
+patient_window = Window.partitionBy("patient_id").orderBy("processed_timestamp").rowsBetween(Window.unboundedPreceding, Window.currentRow)
+
+engineered_df = (
+    raw_df
+    # Temporal context
+    .withColumn("recording_hour",        F.hour("processed_timestamp"))
+    .withColumn("recording_dow",         F.dayofweek("processed_timestamp"))
+    .withColumn("is_weekend",            F.when(F.dayofweek("processed_timestamp").isin([1, 7]), 1).otherwise(0))
+    # Frequency-band ratios (clinically interpretable EEG features)
+    .withColumn("theta_alpha_ratio",     F.col("theta_power") / (F.col("alpha_power")  + F.lit(1e-6)))
+    .withColumn("delta_theta_ratio",     F.col("delta_power") / (F.col("theta_power")  + F.lit(1e-6)))
+    .withColumn("high_low_freq_ratio",   (F.col("beta_power") + F.col("gamma_power")) / (F.col("delta_power") + F.col("theta_power") + F.lit(1e-6)))
+    # Amplitude statistics
+    .withColumn("amplitude_range",       F.col("max_amplitude") - F.col("min_amplitude"))
+    .withColumn("coeff_of_variation",    F.col("std_amplitude") / (F.abs(F.col("mean_amplitude")) + F.lit(1e-6)))
+    # Patient-level rolling history
+    .withColumn("patient_rec_count",     F.count("recording_id").over(patient_window))
+    .withColumn("patient_avg_quality",   F.avg("signal_quality_score").over(patient_window))
+    .withColumn("patient_seizure_rate",  F.avg(F.when(F.col("has_seizure") == 1, 1.0).otherwise(0.0)).over(patient_window))
+)
+
+print(f"Engineered DataFrame row count : {engineered_df.count():,}")
+print(f"Column count                   : {len(engineered_df.columns)}")
+engineered_df.printSchema()
+```
+
+---
+
+## Section 6: Part 3 — Databricks Feature Store
+
+### Step 3 — Create and Populate the Feature Table
+
+```python
+# Cell 3: register feature table in the Databricks Feature Store
+from databricks import feature_store
+
 fs = feature_store.FeatureStoreClient()
 
-# Create feature table from gold layer
-feature_df = spark.sql("""
-    SELECT 
-        patient_id,
+FEATURE_TABLE = "eeg_lakehouse.ml_features.eeg_ml_features"
+
+feature_columns = [
+    "recording_id",
+    "patient_id",
+    "processed_timestamp",
+    "mean_amplitude", "std_amplitude", "max_amplitude", "min_amplitude",
+    "skewness", "kurtosis",
+    "delta_power", "theta_power", "alpha_power", "beta_power", "gamma_power",
+    "dominant_frequency",
+    "signal_quality_score",
+    "num_channels", "sampling_rate", "duration_seconds",
+    "recording_hour", "recording_dow", "is_weekend",
+    "theta_alpha_ratio", "delta_theta_ratio", "high_low_freq_ratio",
+    "amplitude_range", "coeff_of_variation",
+    "patient_rec_count", "patient_avg_quality", "patient_seizure_rate",
+]
+
+feature_df = engineered_df.select(*feature_columns)
+
+try:
+    fs.create_table(
+        name=FEATURE_TABLE,
+        primary_keys=["recording_id"],
+        timestamp_keys=["processed_timestamp"],
+        df=feature_df,
+        description="ML-ready EEG features for seizure detection. Primary key: recording_id.",
+    )
+    print(f"Feature table created: {FEATURE_TABLE}")
+except Exception as exc:
+    if "already exists" in str(exc).lower():
+        fs.write_table(name=FEATURE_TABLE, df=feature_df, mode="merge")
+        print(f"Feature table updated (merge): {FEATURE_TABLE}")
+    else:
+        raise
+```
+
+### Step 4 — Verify Feature Table
+
+```python
+# Cell 4: read back and verify the feature table
+verification_df = fs.read_table(FEATURE_TABLE)
+print(f"Feature table row count : {verification_df.count():,}")
+print(f"Feature table columns   : {len(verification_df.columns)}")
+display(verification_df.limit(5))
+```
+
+---
+
+## Section 7: Part 4 — Model Training with MLflow
+
+### Step 5 — Configure the MLflow Experiment
+
+```python
+# Cell 5: configure MLflow experiment
+import mlflow
+import mlflow.sklearn
+from mlflow.tracking import MlflowClient
+
+EXPERIMENT_PATH = "/Users/eeg-lab/eeg-seizure-detection"
+mlflow.set_experiment(EXPERIMENT_PATH)
+
+# Enable autologging for scikit-learn (captures params, metrics, and model artefact)
+mlflow.sklearn.autolog(log_input_examples=True, log_model_signatures=True, silent=True)
+
+experiment = mlflow.get_experiment_by_name(EXPERIMENT_PATH)
+print(f"Experiment ID  : {experiment.experiment_id}")
+print(f"Artifact store : {experiment.artifact_location}")
+```
+
+### Step 6 — Build the Training Set via Feature Lookups
+
+```python
+# Cell 6: assemble training set using Feature Store lookups
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+LABEL_TABLE  = "eeg_lakehouse.gold.eeg_features"
+LABEL_COLUMN = "has_seizure"
+
+label_df = spark.sql(f"""
+    SELECT
         recording_id,
-        -- Time domain features
-        mean_amplitude,
-        std_amplitude,
-        max_amplitude,
-        min_amplitude,
-        skewness,
-        kurtosis,
-        
-        -- Frequency domain features
-        delta_power,
-        theta_power,
-        alpha_power,
-        beta_power,
-        gamma_power,
-        dominant_frequency,
-        
-        -- Signal quality
-        signal_quality_score,
-        
-        -- Metadata
-        num_channels,
-        sampling_rate,
-        duration_seconds,
-        
-        -- Timestamp
-        processed_timestamp,
-        
-        -- Target variable (example: seizure detection)
-        has_seizure
-    FROM eeg_lakehouse.gold.eeg_features
+        {LABEL_COLUMN} AS label
+    FROM {LABEL_TABLE}
     WHERE processed_timestamp >= current_timestamp() - INTERVAL 90 DAYS
 """)
 
-# Create or update feature table
-fs.create_table(
-    name="eeg_lakehouse.ml_features.eeg_ml_features",
-    primary_keys=["recording_id"],
-    df=feature_df,
-    schema=feature_df.schema,
-    description="ML-ready EEG features for seizure detection and analysis"
-)
-
-print("✅ Feature table created successfully")
-```
-
-### 1.2 Compute Advanced Features
-
-```python
-from pyspark.sql import Window
-from pyspark.sql.functions import *
-
-def create_advanced_features(df):
-    """Create advanced engineered features"""
-    
-    # Window specification for patient-level features
-    patient_window = Window.partitionBy("patient_id").orderBy("processed_timestamp")
-    
-    # Temporal features
-    df = df.withColumn(
-        "recording_hour", hour("processed_timestamp")
-    ).withColumn(
-        "recording_day_of_week", dayofweek("processed_timestamp")
-    ).withColumn(
-        "is_weekend", when(dayofweek("processed_timestamp").isin([1, 7]), 1).otherwise(0)
-    )
-    
-    # Patient historical features
-    df = df.withColumn(
-        "patient_recording_count", count("*").over(patient_window)
-    ).withColumn(
-        "patient_avg_quality", avg("signal_quality_score").over(patient_window)
-    ).withColumn(
-        "patient_seizure_rate", 
-        avg(when(col("has_seizure") == 1, 1.0).otherwise(0.0)).over(patient_window)
-    )
-    
-    # Band power ratios (important for EEG analysis)
-    df = df.withColumn(
-        "theta_alpha_ratio", col("theta_power") / (col("alpha_power") + 0.001)
-    ).withColumn(
-        "delta_theta_ratio", col("delta_power") / (col("theta_power") + 0.001)
-    ).withColumn(
-        "high_low_freq_ratio", 
-        (col("beta_power") + col("gamma_power")) / (col("delta_power") + col("theta_power") + 0.001)
-    )
-    
-    # Signal variability features
-    df = df.withColumn(
-        "amplitude_range", col("max_amplitude") - col("min_amplitude")
-    ).withColumn(
-        "coefficient_of_variation", col("std_amplitude") / (col("mean_amplitude") + 0.001)
-    )
-    
-    return df
-
-# Apply feature engineering
-enhanced_features = create_advanced_features(feature_df)
-
-# Update feature store
-fs.write_table(
-    name="eeg_lakehouse.ml_features.eeg_ml_features",
-    df=enhanced_features,
-    mode="overwrite"
-)
-
-print("✅ Advanced features computed and stored")
-```
-
----
-
-## Part 2: Model Training with MLflow
-
-### 2.1 Set Up MLflow Experiment
-
-```python
-import mlflow
-import mlflow.sklearn
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-import pandas as pd
-
-# Set experiment
-mlflow.set_experiment("/Users/your_email/eeg-seizure-detection")
-
-# Enable autologging
-mlflow.sklearn.autolog()
-
-print("✅ MLflow experiment configured")
-```
-
-### 2.2 Prepare Training Data
-
-```python
-# Load features from Feature Store
 feature_lookup = [
     feature_store.FeatureLookup(
-        table_name="eeg_lakehouse.ml_features.eeg_ml_features",
-        lookup_key="recording_id"
+        table_name=FEATURE_TABLE,
+        lookup_key="recording_id",
+        timestamp_lookup_key="processed_timestamp",
+        feature_names=[
+            "mean_amplitude", "std_amplitude", "max_amplitude", "min_amplitude",
+            "skewness", "kurtosis",
+            "delta_power", "theta_power", "alpha_power", "beta_power", "gamma_power",
+            "dominant_frequency", "signal_quality_score",
+            "recording_hour", "recording_dow", "is_weekend",
+            "theta_alpha_ratio", "delta_theta_ratio", "high_low_freq_ratio",
+            "amplitude_range", "coeff_of_variation",
+            "patient_rec_count", "patient_avg_quality", "patient_seizure_rate",
+        ],
     )
 ]
 
-# Get training data
-training_data = spark.sql("""
-    SELECT 
-        recording_id,
-        has_seizure as label
-    FROM eeg_lakehouse.gold.eeg_features
-    WHERE processed_timestamp >= current_timestamp() - INTERVAL 60 DAYS
-        AND processed_timestamp < current_timestamp() - INTERVAL 7 DAYS
-""")
-
-# Create training set with features
 training_set = fs.create_training_set(
-    df=training_data,
+    df=label_df,
     feature_lookups=feature_lookup,
     label="label",
-    exclude_columns=["patient_id", "processed_timestamp"]
+    exclude_columns=["patient_id", "processed_timestamp"],
 )
 
-# Convert to pandas for sklearn
-training_df = training_set.load_df().toPandas()
+training_pd = training_set.load_df().toPandas()
+X = training_pd.drop(["recording_id", "label"], axis=1)
+y = training_pd["label"]
 
-# Separate features and labels
-X = training_df.drop(["recording_id", "label"], axis=1)
-y = training_df["label"]
-
-# Train-test split
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y
 )
 
-print(f"Training set: {X_train.shape[0]} samples")
-print(f"Test set: {X_test.shape[0]} samples")
-print(f"Positive class ratio: {y_train.mean():.2%}")
+print(f"Training samples : {len(X_train):,}")
+print(f"Test samples     : {len(X_test):,}")
+print(f"Positive class % : {y_train.mean():.2%}")
+print(f"Feature count    : {X_train.shape[1]}")
 ```
 
-### 2.3 Train Multiple Models
+### Step 7 — Train Multiple Classifiers
 
 ```python
-def train_and_evaluate_model(model, model_name, X_train, X_test, y_train, y_test):
-    """Train model and log metrics to MLflow"""
-    
-    with mlflow.start_run(run_name=model_name):
-        # Log parameters
-        mlflow.log_params(model.get_params())
-        
-        # Train model
-        model.fit(X_train, y_train)
-        
-        # Predictions
-        y_pred = model.predict(X_test)
-        y_pred_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else None
-        
-        # Calculate metrics
-        accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred, zero_division=0)
-        recall = recall_score(y_test, y_pred, zero_division=0)
-        f1 = f1_score(y_test, y_pred, zero_division=0)
-        
-        metrics = {
-            "accuracy": accuracy,
-            "precision": precision,
-            "recall": recall,
-            "f1_score": f1
-        }
-        
-        if y_pred_proba is not None:
-            auc = roc_auc_score(y_test, y_pred_proba)
-            metrics["auc_roc"] = auc
-        
-        # Log metrics
-        mlflow.log_metrics(metrics)
-        
-        # Log model
-        mlflow.sklearn.log_model(
-            model, 
-            "model",
-            registered_model_name=f"eeg_seizure_{model_name.lower()}"
-        )
-        
-        print(f"\n{model_name} Results:")
-        for metric, value in metrics.items():
-            print(f"  {metric}: {value:.4f}")
-        
-        return model, metrics
+# Cell 7: train classifiers and log all runs to MLflow
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score,
+)
 
-# Train multiple models
-models = {
-    "LogisticRegression": LogisticRegression(max_iter=1000, random_state=42),
-    "RandomForest": RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42),
-    "GradientBoosting": GradientBoostingClassifier(n_estimators=100, max_depth=5, random_state=42)
+MODELS = {
+    "LogisticRegression":   LogisticRegression(max_iter=1000, random_state=42, class_weight="balanced"),
+    "RandomForest":         RandomForestClassifier(n_estimators=200, max_depth=12, random_state=42, class_weight="balanced"),
+    "GradientBoosting":     GradientBoostingClassifier(n_estimators=200, max_depth=5, random_state=42),
 }
 
-results = {}
-for name, model in models.items():
-    trained_model, metrics = train_and_evaluate_model(
-        model, name, X_train, X_test, y_train, y_test
-    )
-    results[name] = {"model": trained_model, "metrics": metrics}
+run_results = {}
 
-print("\n✅ All models trained and logged to MLflow")
+for model_name, model in MODELS.items():
+    with mlflow.start_run(run_name=model_name) as run:
+        model.fit(X_train, y_train)
+
+        y_pred       = model.predict(X_test)
+        y_pred_proba = model.predict_proba(X_test)[:, 1]
+
+        metrics = {
+            "accuracy"  : accuracy_score(y_test, y_pred),
+            "precision" : precision_score(y_test, y_pred, zero_division=0),
+            "recall"    : recall_score(y_test, y_pred, zero_division=0),
+            "f1_score"  : f1_score(y_test, y_pred, zero_division=0),
+            "auc_roc"   : roc_auc_score(y_test, y_pred_proba),
+        }
+
+        mlflow.log_metrics(metrics)
+        run_results[model_name] = {"run_id": run.info.run_id, "metrics": metrics, "model": model}
+
+        print(f"\n{model_name} | run_id={run.info.run_id}")
+        for k, v in metrics.items():
+            print(f"  {k:<12}: {v:.4f}")
+
+print("\nAll models trained and logged to MLflow.")
 ```
 
 ---
 
-## Part 3: Hyperparameter Tuning
+## Section 8: Part 5 — Hyperparameter Optimisation
 
-### 3.1 Grid Search with MLflow Tracking
+### Step 8 — Grid Search with MLflow Tracking
 
 ```python
+# Cell 8: hyperparameter tuning for Random Forest with full MLflow logging
 from sklearn.model_selection import GridSearchCV
-import numpy as np
 
-def hyperparameter_tuning(X_train, y_train, X_test, y_test):
-    """Perform hyperparameter tuning with MLflow tracking"""
-    
-    # Define parameter grid
-    param_grid = {
-        'n_estimators': [50, 100, 200],
-        'max_depth': [5, 10, 15],
-        'min_samples_split': [2, 5],
-        'min_samples_leaf': [1, 2]
-    }
-    
-    with mlflow.start_run(run_name="RandomForest_GridSearch"):
-        # Create base model
-        rf = RandomForestClassifier(random_state=42)
-        
-        # Grid search
-        grid_search = GridSearchCV(
-            rf, 
-            param_grid, 
-            cv=5, 
-            scoring='f1',
-            n_jobs=-1,
-            verbose=1
-        )
-        
-        # Fit
-        grid_search.fit(X_train, y_train)
-        
-        # Log best parameters
-        mlflow.log_params(grid_search.best_params_)
-        
-        # Evaluate best model
-        best_model = grid_search.best_estimator_
-        y_pred = best_model.predict(X_test)
-        y_pred_proba = best_model.predict_proba(X_test)[:, 1]
-        
-        # Log metrics
-        mlflow.log_metrics({
-            "accuracy": accuracy_score(y_test, y_pred),
-            "precision": precision_score(y_test, y_pred),
-            "recall": recall_score(y_test, y_pred),
-            "f1_score": f1_score(y_test, y_pred),
-            "auc_roc": roc_auc_score(y_test, y_pred_proba),
-            "cv_best_score": grid_search.best_score_
-        })
-        
-        # Log model
-        mlflow.sklearn.log_model(
-            best_model,
-            "model",
-            registered_model_name="eeg_seizure_rf_tuned"
-        )
-        
-        print("\nBest Parameters:")
-        print(grid_search.best_params_)
-        
-        return best_model
+PARAM_GRID = {
+    "n_estimators"   : [100, 200, 400],
+    "max_depth"      : [6, 10, 15],
+    "min_samples_split": [2, 5],
+    "min_samples_leaf" : [1, 2],
+    "class_weight"   : ["balanced"],
+}
 
-best_rf_model = hyperparameter_tuning(X_train, y_train, X_test, y_test)
-print("✅ Hyperparameter tuning complete")
-```
-
----
-
-## Part 4: Feature Importance Analysis
-
-### 4.1 Analyze Feature Importance
-
-```python
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-def plot_feature_importance(model, feature_names, top_n=20):
-    """Plot top N important features"""
-    
-    # Get feature importance
-    if hasattr(model, 'feature_importances_'):
-        importances = model.feature_importances_
-    elif hasattr(model, 'coef_'):
-        importances = np.abs(model.coef_[0])
-    else:
-        print("Model does not have feature importance")
-        return
-    
-    # Create DataFrame
-    feature_importance_df = pd.DataFrame({
-        'feature': feature_names,
-        'importance': importances
-    }).sort_values('importance', ascending=False).head(top_n)
-    
-    # Plot
-    plt.figure(figsize=(10, 8))
-    sns.barplot(data=feature_importance_df, x='importance', y='feature')
-    plt.title(f'Top {top_n} Important Features')
-    plt.xlabel('Importance')
-    plt.ylabel('Feature')
-    plt.tight_layout()
-    
-    # Log to MLflow
-    mlflow.log_figure(plt.gcf(), "feature_importance.png")
-    plt.show()
-    
-    return feature_importance_df
-
-# Analyze best model
-with mlflow.start_run(run_name="Feature_Importance_Analysis"):
-    feature_importance = plot_feature_importance(
-        best_rf_model, 
-        X_train.columns.tolist()
+with mlflow.start_run(run_name="RandomForest_GridSearch") as gs_run:
+    rf_base = RandomForestClassifier(random_state=42)
+    grid_search = GridSearchCV(
+        rf_base, PARAM_GRID,
+        cv=5, scoring="f1",
+        n_jobs=-1, refit=True, verbose=0,
     )
-    
-    # Log top features
-    top_features = feature_importance.head(10)['feature'].tolist()
-    mlflow.log_param("top_10_features", ",".join(top_features))
-    
-    print("\nTop 10 Most Important Features:")
-    print(feature_importance.head(10))
+    grid_search.fit(X_train, y_train)
+
+    best_model  = grid_search.best_estimator_
+    y_pred_gs   = best_model.predict(X_test)
+    y_proba_gs  = best_model.predict_proba(X_test)[:, 1]
+
+    gs_metrics = {
+        "accuracy"       : accuracy_score(y_test, y_pred_gs),
+        "precision"      : precision_score(y_test, y_pred_gs, zero_division=0),
+        "recall"         : recall_score(y_test, y_pred_gs, zero_division=0),
+        "f1_score"       : f1_score(y_test, y_pred_gs, zero_division=0),
+        "auc_roc"        : roc_auc_score(y_test, y_proba_gs),
+        "cv_best_f1"     : grid_search.best_score_,
+    }
+
+    mlflow.log_params(grid_search.best_params_)
+    mlflow.log_metrics(gs_metrics)
+
+    mlflow.sklearn.log_model(
+        best_model,
+        artifact_path="model",
+        registered_model_name="eeg_seizure_rf_tuned",
+    )
+
+    run_results["RandomForest_GridSearch"] = {
+        "run_id": gs_run.info.run_id, "metrics": gs_metrics, "model": best_model,
+    }
+
+    print(f"Best params : {grid_search.best_params_}")
+    print(f"CV F1       : {grid_search.best_score_:.4f}")
+    print(f"Test F1     : {gs_metrics['f1_score']:.4f}")
+    print(f"Test AUC    : {gs_metrics['auc_roc']:.4f}")
+    print(f"Run ID      : {gs_run.info.run_id}")
 ```
 
 ---
 
-## Part 5: Model Registry and Versioning
+## Section 9: Part 6 — Feature Importance Analysis
 
-### 5.1 Promote Model to Registry
+### Step 9 — Plot and Log Feature Importance
 
 ```python
-from mlflow.tracking import MlflowClient
+# Cell 9: compute and log feature importance for the best Random Forest
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
+TOP_N = 20
+importances = best_model.feature_importances_
+feature_names = X_train.columns.tolist()
+
+importance_pairs = sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)
+top_features, top_importances = zip(*importance_pairs[:TOP_N])
+
+with mlflow.start_run(run_name="FeatureImportance_Analysis"):
+    fig, ax = plt.subplots(figsize=(10, 8))
+    y_pos = np.arange(TOP_N)
+    ax.barh(y_pos, top_importances[::-1], color="#1f77b4")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(list(top_features[::-1]), fontsize=9)
+    ax.set_xlabel("Importance (mean decrease in impurity)")
+    ax.set_title(f"Top {TOP_N} Feature Importances — Random Forest (Grid Search)")
+    plt.tight_layout()
+
+    mlflow.log_figure(fig, "feature_importance.png")
+    mlflow.log_param("top_features", ",".join(top_features[:10]))
+    plt.close(fig)
+
+print("Top 10 features:")
+for name, score in importance_pairs[:10]:
+    print(f"  {name:<35}: {score:.6f}")
+```
+
+---
+
+## Section 10: Part 7 — Model Registry and Promotion
+
+### Step 10 — Select the Best Run and Register the Model
+
+```python
+# Cell 10: identify the best run by F1 score and register the model
+experiment    = mlflow.get_experiment_by_name(EXPERIMENT_PATH)
+runs_df       = mlflow.search_runs(
+    experiment_ids=[experiment.experiment_id],
+    order_by=["metrics.f1_score DESC"],
+    max_results=10,
+)
+
+best_run = runs_df.iloc[0]
+best_run_id      = best_run["run_id"]
+best_f1          = best_run["metrics.f1_score"]
+REGISTRY_MODEL   = "eeg_seizure_production"
+
+print(f"Best run ID : {best_run_id}")
+print(f"Best F1     : {best_f1:.4f}")
+
+model_version = mlflow.register_model(
+    model_uri=f"runs:/{best_run_id}/model",
+    name=REGISTRY_MODEL,
+)
+print(f"Registered as version {model_version.version} of '{REGISTRY_MODEL}'")
+```
+
+### Step 11 — Transition Model Through Staging to Production
+
+```python
+# Cell 11: run validation gate, then promote or reject
 client = MlflowClient()
 
-def promote_model_to_staging(model_name, run_id):
-    """Promote model to Staging stage"""
-    
-    # Get model version
-    model_version = mlflow.register_model(
-        f"runs:/{run_id}/model",
-        model_name
-    )
-    
-    # Transition to Staging
+STAGING_F1_THRESHOLD    = 0.70
+PRODUCTION_F1_THRESHOLD = 0.75
+
+def transition_model(model_name: str, version: str, stage: str) -> None:
     client.transition_model_version_stage(
         name=model_name,
-        version=model_version.version,
-        stage="Staging",
-        archive_existing_versions=True
+        version=version,
+        stage=stage,
+        archive_existing_versions=True,
     )
-    
-    print(f"✅ Model {model_name} version {model_version.version} promoted to Staging")
-    
-    return model_version
+    print(f"Model '{model_name}' version {version} → {stage}")
 
-# Get best run ID from experiment
-experiment = mlflow.get_experiment_by_name("/Users/your_email/eeg-seizure-detection")
-runs = mlflow.search_runs(experiment_ids=[experiment.experiment_id], order_by=["metrics.f1_score DESC"])
-best_run_id = runs.iloc[0]['run_id']
 
-# Promote to staging
-model_version = promote_model_to_staging("eeg_seizure_production", best_run_id)
-```
+# Promote to Staging unconditionally for validation
+transition_model(REGISTRY_MODEL, model_version.version, "Staging")
 
-### 5.2 Model Validation and Production Promotion
+# Validation gate: load model from Staging and re-evaluate
+staging_model   = mlflow.pyfunc.load_model(f"models:/{REGISTRY_MODEL}/Staging")
+y_pred_staging  = staging_model.predict(X_test)
+staging_f1      = f1_score(y_test, y_pred_staging, zero_division=0)
+staging_acc     = accuracy_score(y_test, y_pred_staging)
 
-```python
-def validate_model_performance(model_uri, X_test, y_test, threshold_f1=0.75):
-    """Validate model performance before production"""
-    
-    # Load model
-    model = mlflow.sklearn.load_model(model_uri)
-    
-    # Predictions
-    y_pred = model.predict(X_test)
-    
-    # Calculate metrics
-    f1 = f1_score(y_test, y_pred)
-    accuracy = accuracy_score(y_test, y_pred)
-    
-    print(f"Validation F1 Score: {f1:.4f}")
-    print(f"Validation Accuracy: {accuracy:.4f}")
-    
-    # Check if meets threshold
-    if f1 >= threshold_f1:
-        print(f"✅ Model meets performance threshold (F1 >= {threshold_f1})")
-        return True
-    else:
-        print(f"❌ Model does not meet performance threshold (F1 < {threshold_f1})")
-        return False
+print(f"\nStaging validation — F1: {staging_f1:.4f} | Accuracy: {staging_acc:.4f}")
+print(f"Production F1 threshold : {PRODUCTION_F1_THRESHOLD}")
 
-# Validate staging model
-staging_model_uri = f"models:/eeg_seizure_production/Staging"
-if validate_model_performance(staging_model_uri, X_test, y_test):
-    # Promote to Production
-    client.transition_model_version_stage(
-        name="eeg_seizure_production",
-        version=model_version.version,
-        stage="Production",
-        archive_existing_versions=True
-    )
-    print(f"\n✅ Model promoted to Production")
+if staging_f1 >= PRODUCTION_F1_THRESHOLD:
+    transition_model(REGISTRY_MODEL, model_version.version, "Production")
+    print("Model promoted to Production.")
 else:
-    print("\n⚠️ Model validation failed. Not promoting to Production.")
-```
-
----
-
-## Part 6: Batch Inference Pipeline
-
-### 6.1 Create Batch Scoring Function
-
-```python
-def batch_predict(model_uri, input_table, output_table):
-    """Perform batch prediction on new data"""
-    
-    # Load model from registry
-    model = mlflow.pyfunc.load_model(model_uri)
-    
-    # Load input data
-    input_df = spark.table(input_table)
-    
-    # Prepare features (same preprocessing as training)
-    feature_columns = X_train.columns.tolist()
-    feature_df = input_df.select(["recording_id"] + feature_columns)
-    
-    # Convert to pandas for prediction
-    feature_pd = feature_df.toPandas()
-    X_inference = feature_pd[feature_columns]
-    
-    # Predict
-    predictions = model.predict(X_inference)
-    
-    # Add predictions to DataFrame
-    feature_pd['prediction'] = predictions
-    feature_pd['prediction_timestamp'] = pd.Timestamp.now()
-    
-    # Convert back to Spark
-    predictions_df = spark.createDataFrame(feature_pd)
-    
-    # Write to output table
-    predictions_df.write.format("delta").mode("overwrite").saveAsTable(output_table)
-    
-    print(f"✅ Batch predictions written to {output_table}")
-    print(f"   Total records: {predictions_df.count()}")
-    print(f"   Predicted seizures: {predictions_df.filter(col('prediction') == 1).count()}")
-    
-    return predictions_df
-
-# Run batch inference
-predictions = batch_predict(
-    model_uri="models:/eeg_seizure_production/Production",
-    input_table="eeg_lakehouse.ml_features.eeg_ml_features",
-    output_table="eeg_lakehouse.ml_predictions.seizure_predictions"
-)
-```
-
-### 6.2 Create Inference Monitoring
-
-```python
-def monitor_prediction_distribution(predictions_df):
-    """Monitor prediction distribution and log to MLflow"""
-    
-    with mlflow.start_run(run_name="Inference_Monitoring"):
-        # Calculate distribution metrics
-        total_predictions = predictions_df.count()
-        positive_predictions = predictions_df.filter(col("prediction") == 1).count()
-        positive_rate = positive_predictions / total_predictions
-        
-        # Log metrics
-        mlflow.log_metrics({
-            "total_predictions": total_predictions,
-            "positive_predictions": positive_predictions,
-            "positive_rate": positive_rate
-        })
-        
-        # Create visualization
-        prediction_counts = predictions_df.groupBy("prediction").count().toPandas()
-        
-        plt.figure(figsize=(8, 6))
-        plt.bar(prediction_counts['prediction'].astype(str), prediction_counts['count'])
-        plt.title('Prediction Distribution')
-        plt.xlabel('Prediction (0=No Seizure, 1=Seizure)')
-        plt.ylabel('Count')
-        mlflow.log_figure(plt.gcf(), "prediction_distribution.png")
-        plt.show()
-        
-        print(f"\nPrediction Monitoring:")
-        print(f"  Total Predictions: {total_predictions}")
-        print(f"  Positive Predictions: {positive_predictions}")
-        print(f"  Positive Rate: {positive_rate:.2%}")
-
-monitor_prediction_distribution(predictions)
-```
-
----
-
-## Part 7: Automated Model Retraining
-
-### 7.1 Create Retraining Pipeline
-
-```python
-def automated_retraining_pipeline():
-    """Complete automated retraining pipeline"""
-    
-    with mlflow.start_run(run_name="Automated_Retraining"):
-        print("Starting automated retraining pipeline...\n")
-        
-        # 1. Load latest data
-        print("Step 1: Loading latest training data...")
-        training_data = spark.sql("""
-            SELECT *
-            FROM eeg_lakehouse.ml_features.eeg_ml_features
-            WHERE processed_timestamp >= current_timestamp() - INTERVAL 30 DAYS
-        """)
-        
-        training_pd = training_data.toPandas()
-        X_new = training_pd.drop(["recording_id", "label", "patient_id", "processed_timestamp"], axis=1)
-        y_new = training_pd["label"]
-        
-        print(f"  Loaded {len(X_new)} training samples\n")
-        
-        # 2. Check for data drift
-        print("Step 2: Checking for data drift...")
-        # Simple drift check: compare feature distributions
-        drift_detected = False
-        # (In production, use proper drift detection methods)
-        
-        # 3. Train new model if drift detected or scheduled
-        print("Step 3: Training new model...")
-        X_train_new, X_test_new, y_train_new, y_test_new = train_test_split(
-            X_new, y_new, test_size=0.2, random_state=42
-        )
-        
-        new_model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
-            random_state=42
-        )
-        new_model.fit(X_train_new, y_train_new)
-        
-        # 4. Evaluate new model
-        print("Step 4: Evaluating new model...")
-        y_pred_new = new_model.predict(X_test_new)
-        new_f1 = f1_score(y_test_new, y_pred_new)
-        new_accuracy = accuracy_score(y_test_new, y_pred_new)
-        
-        mlflow.log_metrics({
-            "retrained_f1": new_f1,
-            "retrained_accuracy": new_accuracy
-        })
-        
-        print(f"  New model F1: {new_f1:.4f}")
-        print(f"  New model Accuracy: {new_accuracy:.4f}\n")
-        
-        # 5. Compare with production model
-        print("Step 5: Comparing with production model...")
-        prod_model = mlflow.sklearn.load_model("models:/eeg_seizure_production/Production")
-        y_pred_prod = prod_model.predict(X_test_new)
-        prod_f1 = f1_score(y_test_new, y_pred_prod)
-        
-        print(f"  Production model F1: {prod_f1:.4f}")
-        print(f"  New model F1: {new_f1:.4f}\n")
-        
-        # 6. Promote if better
-        if new_f1 > prod_f1:
-            print("Step 6: New model is better. Promoting to production...")
-            mlflow.sklearn.log_model(
-                new_model,
-                "model",
-                registered_model_name="eeg_seizure_production"
-            )
-            print("  ✅ New model promoted to Production")
-        else:
-            print("Step 6: Production model is still better. Keeping current model.")
-            print("  ℹ️ No model update needed")
-        
-        print("\n✅ Automated retraining pipeline complete")
-
-# Run automated retraining
-automated_retraining_pipeline()
-```
-
----
-
-## Part 8: Model Serving and APIs
-
-### 8.1 Create Model Serving Endpoint
-
-```python
-# Note: Model serving is typically configured through Databricks UI
-# Here's the equivalent code approach:
-
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.serving import ServedModelInput, EndpointCoreConfigInput
-
-# Initialize workspace client
-w = WorkspaceClient()
-
-# Create serving endpoint
-try:
-    endpoint = w.serving_endpoints.create(
-        name="eeg-seizure-detector",
-        config=EndpointCoreConfigInput(
-            served_models=[
-                ServedModelInput(
-                    model_name="eeg_seizure_production",
-                    model_version="1",
-                    workload_size="Small",
-                    scale_to_zero_enabled=True
-                )
-            ]
-        )
+    print(
+        f"Model did NOT meet the production threshold "
+        f"(F1={staging_f1:.4f} < {PRODUCTION_F1_THRESHOLD}). "
+        f"Keeping in Staging for further review."
     )
-    print(f"✅ Serving endpoint created: {endpoint.name}")
+```
+
+---
+
+## Section 11: Part 8 — Batch Inference
+
+### Step 12 — Run Batch Inference against the Production Model
+
+```python
+# Cell 12: batch inference using the registered production model
+INFERENCE_TABLE  = "eeg_lakehouse.ml_features.eeg_ml_features"
+PREDICTIONS_TABLE = "eeg_lakehouse.ml_predictions.seizure_predictions"
+
+prod_model = mlflow.pyfunc.load_model(f"models:/{REGISTRY_MODEL}/Production")
+
+inference_spark_df = spark.table(INFERENCE_TABLE)
+model_feature_cols = X_train.columns.tolist()
+
+inference_pd = inference_spark_df.select(
+    ["recording_id"] + model_feature_cols
+).toPandas()
+
+preds = prod_model.predict(inference_pd[model_feature_cols])
+
+inference_pd["prediction"]            = preds
+inference_pd["prediction_timestamp"]  = pd.Timestamp.utcnow()
+inference_pd["model_version"]         = model_version.version
+inference_pd["model_name"]            = REGISTRY_MODEL
+
+predictions_spark_df = spark.createDataFrame(inference_pd)
+
+(
+    predictions_spark_df
+    .write.format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(PREDICTIONS_TABLE)
+)
+
+total     = predictions_spark_df.count()
+positives = int(inference_pd["prediction"].sum())
+print(f"Predictions written to : {PREDICTIONS_TABLE}")
+print(f"Total records          : {total:,}")
+print(f"Predicted seizures     : {positives:,} ({positives / total:.2%})")
+```
+
+### Step 13 — Monitor Prediction Distribution
+
+```python
+# Cell 13: log prediction distribution metrics to MLflow
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+with mlflow.start_run(run_name="Inference_Distribution_Monitor"):
+    total_preds    = len(inference_pd)
+    positive_preds = int(inference_pd["prediction"].sum())
+    positive_rate  = positive_preds / total_preds if total_preds > 0 else 0.0
+
+    mlflow.log_metrics({
+        "total_predictions"  : total_preds,
+        "positive_predictions": positive_preds,
+        "positive_rate"      : positive_rate,
+    })
+    mlflow.log_param("model_version", model_version.version)
+
+    counts = inference_pd["prediction"].value_counts().sort_index()
+    labels = ["No Seizure (0)", "Seizure (1)"]
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.bar(labels[:len(counts)], counts.values, color=["#2196F3", "#F44336"][:len(counts)])
+    ax.set_title("Batch Inference — Prediction Distribution")
+    ax.set_ylabel("Record Count")
+    for i, v in enumerate(counts.values):
+        ax.text(i, v + max(counts.values) * 0.01, f"{v:,}", ha="center", fontsize=10)
+    plt.tight_layout()
+    mlflow.log_figure(fig, "inference_distribution.png")
+    plt.close(fig)
+
+print(f"Total predictions : {total_preds:,}")
+print(f"Positive rate     : {positive_rate:.2%}")
+```
+
+---
+
+## Section 12: Part 9 — Automated Retraining
+
+### Step 14 — Implement a Scheduled Retraining Pipeline
+
+```python
+# Cell 14: automated retraining pipeline with champion/challenger comparison
+def automated_retraining_pipeline(days_of_data: int = 30, f1_improvement_threshold: float = 0.01) -> None:
+    """
+    Retrain the model on recent data and promote only if F1 improves
+    beyond f1_improvement_threshold over the current Production model.
+    """
+    with mlflow.start_run(run_name="Automated_Retraining") as retrain_run:
+        # 1. Load recent data
+        recent_pd = spark.sql(f"""
+            SELECT f.*, g.has_seizure AS label
+            FROM {FEATURE_TABLE} f
+            INNER JOIN eeg_lakehouse.gold.eeg_features g USING (recording_id)
+            WHERE f.processed_timestamp >= current_timestamp() - INTERVAL {days_of_data} DAYS
+        """).toPandas()
+
+        if len(recent_pd) < 100:
+            print(f"Insufficient data for retraining ({len(recent_pd)} rows). Aborting.")
+            return
+
+        X_new = recent_pd[model_feature_cols]
+        y_new = recent_pd["label"]
+        X_tr, X_te, y_tr, y_te = train_test_split(X_new, y_new, test_size=0.2, random_state=42, stratify=y_new)
+
+        # 2. Train challenger model
+        challenger = RandomForestClassifier(
+            n_estimators=200, max_depth=12, random_state=42, class_weight="balanced",
+        )
+        challenger.fit(X_tr, y_tr)
+        challenger_f1 = f1_score(y_te, challenger.predict(X_te), zero_division=0)
+
+        mlflow.log_metrics({
+            "challenger_f1"   : challenger_f1,
+            "training_samples": len(X_tr),
+        })
+
+        # 3. Evaluate champion model on the same test set
+        try:
+            champion = mlflow.sklearn.load_model(f"models:/{REGISTRY_MODEL}/Production")
+            champion_f1 = f1_score(y_te, champion.predict(X_te), zero_division=0)
+        except Exception:
+            champion_f1 = 0.0
+
+        mlflow.log_metric("champion_f1", champion_f1)
+
+        print(f"Champion F1   : {champion_f1:.4f}")
+        print(f"Challenger F1 : {challenger_f1:.4f}")
+
+        # 4. Promote challenger if it improves F1 by the required margin
+        if challenger_f1 > champion_f1 + f1_improvement_threshold:
+            mlflow.sklearn.log_model(
+                challenger,
+                artifact_path="model",
+                registered_model_name=REGISTRY_MODEL,
+            )
+            print(f"Challenger promoted to Production (F1 improved by {challenger_f1 - champion_f1:.4f}).")
+        else:
+            print("Champion retained. Challenger did not exceed the improvement threshold.")
+
+
+automated_retraining_pipeline(days_of_data=30, f1_improvement_threshold=0.01)
+```
+
+---
+
+## Section 13: Part 10 — End-to-End Verification
+
+### Step 15 — Run the Pipeline Smoke Test
+
+```python
+# Cell 15: end-to-end pipeline smoke test
+import sys
+
+failures = []
+
+# Test 1 — Feature table accessible
+try:
+    ft_count = spark.table(FEATURE_TABLE).count()
+    assert ft_count > 0, "Feature table is empty."
+    print(f"[PASS] Feature table '{FEATURE_TABLE}': {ft_count:,} rows")
+except AssertionError as e:
+    failures.append(f"Feature table: {e}")
+
+# Test 2 — Production model loadable
+try:
+    pm = mlflow.pyfunc.load_model(f"models:/{REGISTRY_MODEL}/Production")
+    assert pm is not None
+    print(f"[PASS] Production model '{REGISTRY_MODEL}' loaded successfully")
 except Exception as e:
-    print(f"Endpoint may already exist: {e}")
-```
+    failures.append(f"Production model: {e}")
 
-### 8.2 Query Serving Endpoint
+# Test 3 — Prediction schema correct
+try:
+    sample_pd = spark.table(FEATURE_TABLE).limit(5).toPandas()[model_feature_cols]
+    sample_preds = pm.predict(sample_pd)
+    assert len(sample_preds) == 5, f"Expected 5 predictions, got {len(sample_preds)}"
+    assert set(sample_preds).issubset({0, 1}), "Predictions contain values outside {0, 1}"
+    print(f"[PASS] Prediction schema: {sample_preds.tolist()}")
+except Exception as e:
+    failures.append(f"Prediction schema: {e}")
 
-```python
-import requests
-import json
+# Test 4 — Predictions table populated
+try:
+    pt_count = spark.table(PREDICTIONS_TABLE).count()
+    assert pt_count > 0, "Predictions table is empty."
+    print(f"[PASS] Predictions table '{PREDICTIONS_TABLE}': {pt_count:,} rows")
+except AssertionError as e:
+    failures.append(f"Predictions table: {e}")
 
-def query_model_endpoint(endpoint_name, input_data):
-    """Query model serving endpoint"""
-    
-    # Get Databricks token and host
-    token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
-    host = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiUrl().get()
-    
-    # Construct URL
-    url = f"{host}/serving-endpoints/{endpoint_name}/invocations"
-    
-    # Prepare headers
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    
-    # Prepare payload
-    payload = {
-        "dataframe_records": input_data.to_dict(orient="records")
-    }
-    
-    # Make request
-    response = requests.post(url, headers=headers, json=payload)
-    
-    if response.status_code == 200:
-        return response.json()
-    else:
-        raise Exception(f"Request failed: {response.status_code} - {response.text}")
+# Test 5 — MLflow experiment has runs
+try:
+    exp = mlflow.get_experiment_by_name(EXPERIMENT_PATH)
+    runs = mlflow.search_runs(experiment_ids=[exp.experiment_id], max_results=1)
+    assert len(runs) > 0, "No runs found in experiment."
+    print(f"[PASS] MLflow experiment has {len(runs)}+ run(s)")
+except AssertionError as e:
+    failures.append(f"MLflow experiment: {e}")
 
-# Example usage
-sample_data = X_test.head(5)
-predictions = query_model_endpoint("eeg-seizure-detector", sample_data)
-print("Predictions:", predictions)
+if failures:
+    print("\n[FAIL] The following checks failed:")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+else:
+    print("\nAll smoke tests passed.")
 ```
 
 ---
 
-## Part 9: Verification and Testing
+## Section 14: Exam Reference Tables
 
-### 9.1 End-to-End Pipeline Test
+### MLflow Tracking — Key API Methods
 
-```python
-def test_ml_pipeline():
-    """Test complete ML pipeline"""
-    
-    print("Testing ML Pipeline...\n")
-    
-    # Test 1: Feature Store
-    print("Test 1: Feature Store access")
-    features = spark.table("eeg_lakehouse.ml_features.eeg_ml_features")
-    assert features.count() > 0, "Feature table is empty"
-    print("  ✅ Feature Store accessible\n")
-    
-    # Test 2: Model Registry
-    print("Test 2: Model Registry")
-    prod_model = mlflow.pyfunc.load_model("models:/eeg_seizure_production/Production")
-    assert prod_model is not None, "Production model not found"
-    print("  ✅ Production model loaded\n")
-    
-    # Test 3: Batch Inference
-    print("Test 3: Batch Inference")
-    test_features = features.limit(10).toPandas()
-    X_test_sample = test_features.drop(["recording_id", "label", "patient_id", "processed_timestamp"], axis=1)
-    predictions = prod_model.predict(X_test_sample)
-    assert len(predictions) == 10, "Prediction count mismatch"
-    print(f"  ✅ Successfully predicted {len(predictions)} samples\n")
-    
-    # Test 4: Predictions Table
-    print("Test 4: Predictions Table")
-    predictions_table = spark.table("eeg_lakehouse.ml_predictions.seizure_predictions")
-    assert predictions_table.count() > 0, "Predictions table is empty"
-    print("  ✅ Predictions table populated\n")
-    
-    print("✅ All ML pipeline tests passed!")
+| Method | Purpose | Exam consideration |
+|---|---|---|
+| `mlflow.set_experiment(path)` | Sets the active experiment by path | Path is workspace-relative for managed MLflow |
+| `mlflow.start_run(run_name)` | Opens a new run context | Nested runs are created via `nested=True` |
+| `mlflow.log_params(dict)` | Logs a dictionary of hyperparameters | Use for model configuration |
+| `mlflow.log_metrics(dict)` | Logs numeric evaluation metrics | Can be called multiple times per run |
+| `mlflow.log_figure(fig, path)` | Logs a Matplotlib/Plotly figure as an artifact | Path is relative to the run artifact root |
+| `mlflow.sklearn.log_model(model, path, registered_model_name)` | Logs and optionally registers a sklearn model | `registered_model_name` triggers registry creation |
+| `mlflow.search_runs(experiment_ids, order_by)` | Returns a pandas DataFrame of runs | Use `order_by=["metrics.f1_score DESC"]` to find the champion |
 
-test_ml_pipeline()
-```
+### Model Registry — Transition API
 
----
+| Action | MlflowClient method | Notes |
+|---|---|---|
+| Register model version | `mlflow.register_model(uri, name)` | Returns `ModelVersion` object |
+| Transition stage | `client.transition_model_version_stage(name, version, stage)` | Valid stages: `Staging`, `Production`, `Archived` |
+| Archive previous versions | Pass `archive_existing_versions=True` | Prevents accumulation of active Production versions |
+| Load from registry | `mlflow.pyfunc.load_model(f"models:/{name}/{stage}")` | `pyfunc` is framework-agnostic |
 
-## Exercises
+### Feature Store — Key Concepts for the Exam
 
-### Exercise 1: Advanced Feature Engineering
-Implement additional EEG-specific features:
-- Spectral entropy
-- Hjorth parameters (activity, mobility, complexity)
-- Cross-channel correlation features
-- Wavelet transform coefficients
+| Concept | Key detail |
+|---|---|
+| Primary key | Must be declared at table creation; used for point-in-time lookups and merge writes |
+| Timestamp key | Enables point-in-time feature retrieval to prevent training/serving skew |
+| `FeatureLookup` | Declared in training; Feature Store replays the same logic during batch or online serving |
+| `create_training_set` | Joins labels with feature lookups; produces a `TrainingSet` object |
+| `load_df()` | Materialises the training set as a Spark DataFrame; call `.toPandas()` for sklearn |
 
-### Exercise 2: Deep Learning Model
-Train a neural network using Keras/TensorFlow:
-- Build a 1D CNN for raw EEG signal classification
-- Compare performance with traditional ML models
-- Log model to MLflow with custom metrics
+### Certified Professional Exam Domain Mapping — Day 10 Topics
 
-### Exercise 3: Model Explainability
-Implement model explainability:
-- Use SHAP values to explain predictions
-- Create patient-level explanation reports
-- Log explanation artifacts to MLflow
+| Topic | Professional exam domain |
+|---|---|
+| Feature Store table creation and writes | Domain 5 — ML with Databricks |
+| MLflow autologging for sklearn | Domain 5 — MLflow tracking |
+| `GridSearchCV` with nested MLflow runs | Domain 5 — MLflow tracking |
+| Model Registry lifecycle transitions | Domain 5 — Model Registry |
+| Batch inference with `pyfunc` | Domain 5 — Model deployment |
+| Champion/challenger retraining pattern | Domain 5 — ML workflow automation |
+| Feature engineering with Window functions | Domain 2 — ELT with Apache Spark |
 
 ---
 
-## Best Practices
+## Section 15: Self-Check Questions
 
-### Experiment Tracking
-- Always use MLflow for experiment tracking
-- Log all hyperparameters, metrics, and artifacts
-- Use descriptive run names and tags
-- Document model assumptions and limitations
+1. What is the difference between `mlflow.sklearn.log_model()` and `mlflow.register_model()`?
+2. Why must a Feature Store table declare a `timestamp_key` for EEG data?
+3. What stage must a model be in before it can be transitioned to `Production`?
+4. How does `archive_existing_versions=True` affect the Model Registry when promoting a new version to Production?
+5. In the retraining pipeline, why is the champion model evaluated on the **challenger's** test split rather than a fixed historical hold-out?
+6. What is the purpose of the `pyfunc` model flavour in batch inference?
 
-### Feature Engineering
-- Use Feature Store for consistent feature computation
-- Version your feature definitions
-- Document feature engineering logic
-- Monitor feature distribution over time
+**Reference answers:**
 
-### Model Deployment
-- Always validate models before production
-- Use staged rollouts (Staging → Production)
-- Monitor model performance in production
-- Implement automated retraining pipelines
-- Set up alerts for performance degradation
-
-### Model Governance
-- Document model lineage and data provenance
-- Track model versions and transitions
-- Implement approval workflows for production
-- Maintain model cards with performance metrics
+1. `mlflow.sklearn.log_model()` serialises and saves the model as an artifact inside a run. `mlflow.register_model()` creates a versioned entry in the Model Registry pointing to an artifact URI; the two calls are often chained but are independent operations.
+2. The `timestamp_key` enables point-in-time feature retrieval during training set construction, preventing feature leakage by ensuring only features that were available at the exact recording timestamp are joined to each label.
+3. There is no strict requirement to pass through `Staging` before `Production`; the stage transition API allows direct transitions. However, the recommended governance pattern promotes to `Staging` first for validation before promoting to `Production`.
+4. Setting `archive_existing_versions=True` automatically moves all other versions that are currently in the target stage (`Production`) to `Archived`, ensuring only one version is active at a time.
+5. Evaluating both champion and challenger on the same held-out slice from the challenger's recent data ensures a fair comparison on the distribution of current data, rather than penalising the challenger for a distribution shift that the champion was originally trained on.
+6. The `pyfunc` flavour provides a unified `predict()` interface regardless of the underlying framework (sklearn, XGBoost, TensorFlow, etc.), enabling framework-agnostic batch inference code that requires no changes when the model implementation changes.
 
 ---
 
-## Troubleshooting
+## Section 16: Day 10 Summary
 
-### Issue: Out of Memory During Training
-**Solution**:
-```python
-# Use sampling for large datasets
-training_sample = training_df.sample(fraction=0.1, seed=42)
+| Artifact | Tool | Medallion layer | Exam domain |
+|---|---|---|---|
+| Engineered feature DataFrame | PySpark Window functions | Gold → Feature Store | Domain 2 |
+| `eeg_ml_features` Feature Store table | Databricks Feature Store | Feature Store | Domain 5 |
+| MLflow experiment with three classifier runs | MLflow autologging | — | Domain 5 |
+| Random Forest GridSearch run | MLflow + sklearn | — | Domain 5 |
+| Feature importance chart | Matplotlib + MLflow artifact | — | Domain 5 |
+| Registered model — `eeg_seizure_production` | MLflow Model Registry | — | Domain 5 |
+| Staging → Production promotion | `MlflowClient.transition_model_version_stage` | — | Domain 5 |
+| `seizure_predictions` batch inference table | `mlflow.pyfunc` + Delta write | Gold/Predictions | Domain 5 |
+| Champion/challenger retraining pipeline | MLflow run + registry update | — | Domain 5 |
+| Smoke test suite | Python assertions | All layers | Domain 5 |
 
-# Or use distributed training with Spark ML
-from pyspark.ml.classification import RandomForestClassifier as SparkRF
-```
-
-### Issue: Model Registry Not Updating
-**Solution**:
-```python
-# Force model registry sync
-from mlflow.tracking import MlflowClient
-client = MlflowClient()
-client.list_registered_models()  # Refresh cache
-```
-
-### Issue: Feature Store Conflicts
-**Solution**:
-```python
-# Drop and recreate feature table
-fs.drop_table("eeg_lakehouse.ml_features.eeg_ml_features")
-fs.create_table(...)
-```
-
----
-
-## Key Takeaways
-
-1. ✅ Feature Store provides centralized feature management
-2. ✅ MLflow enables complete experiment tracking and model versioning
-3. ✅ Model Registry supports staged deployments and governance
-4. ✅ Automated pipelines ensure consistent model updates
-5. ✅ Monitoring and validation prevent production issues
-
----
-
-## Project Completion Summary
-
-Congratulations! You've completed the 10-day EEG Lakehouse journey:
-
-**Days 1-3**: Foundation
-- Project setup and data ingestion
-- Bronze layer for raw EEG data
-- Silver layer for cleaned data
-
-**Days 4-6**: Data Engineering
-- Advanced preprocessing with distributed computing
-- Delta Lake optimization and time travel
-- Gold layer feature engineering
-
-**Days 7-8**: Pipeline Automation
-- Delta Live Tables for streaming
-- Topological Data Analysis
-- Production deployment
-
-**Days 9-10**: Production Operations
-- Monitoring and data quality
-- Machine learning and advanced analytics
-
----
-
-## Next Steps Beyond This Course
-
-1. **Production Deployment**
-   - Set up CI/CD pipelines
-   - Implement blue-green deployments
-   - Configure production monitoring
-
-2. **Advanced Analytics**
-   - Real-time streaming inference
-   - Multi-model ensembles
-   - Advanced deep learning (transformers, attention)
-
-3. **Scale and Optimize**
-   - Partition optimization
-   - Query performance tuning
-   - Cost optimization strategies
-
-4. **Governance and Compliance**
-   - HIPAA compliance for healthcare data
-   - Data lineage and audit trails
-   - Privacy-preserving ML techniques
-
----
-
-**Day 10 Complete!** ✅
-
-**Entire EEG Lakehouse Project Complete!** 🎉
-
-You now have a production-ready EEG data lakehouse with end-to-end ML capabilities!
+**Next**: Day 11 covers real-time streaming inference, Structured Streaming with Delta Live Tables, and Kafka/Auto Loader event-driven architectures for continuous EEG signal processing.
