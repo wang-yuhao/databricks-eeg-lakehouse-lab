@@ -1,283 +1,293 @@
-# Day 6: Gold Layer — Feature Engineering and Aggregations for TDA
+# Day 6: Gold Layer — Feature Engineering and Aggregations
 
 **Notebook**: `notebooks/day06_gold_features.py`
 **Source modules**: `src/gold/build_features.py`
-**Exam domains**: Spark SQL & Python (Domain 2), Data pipelines (Domain 1)
+**Exam domains**: Spark SQL & Python (Domain 2), Data Pipelines (Domain 1)
 **Time estimate**: 3–4 hours
-**Prerequisite**: Day 5 completed, Silver table optimized
+**Prerequisite**: Day 5 completed; Silver table `eeg_lakehouse.silver.cleaned_epochs` is optimised and accessible
+
+---
+
+## Environment Setup
+
+Complete every sub-section below before executing any notebook cell.
+
+### 1. Create a GitHub Personal Access Token (PAT)
+
+1. Navigate to [https://github.com/settings/tokens](https://github.com/settings/tokens) and sign in.
+2. Click **Generate new token (classic)**.
+3. Set **Note** to `databricks-eeg-lab`.
+4. Set **Expiration** to `90 days`.
+5. Select the following scopes: `repo` (full), `workflow`.
+6. Click **Generate token** and copy the value immediately.
+
+### 2. Configure Databricks Git Integration
+
+1. In the Databricks workspace, click your username in the top-right corner and select **User Settings**.
+2. Click the **Git Integration** tab.
+3. Set **Git provider** to `GitHub`.
+4. Paste the PAT into the **Token** field and enter your GitHub username.
+5. Click **Save**.
+
+### 3. Clone the Repository into Databricks Repos
+
+1. In the left sidebar, click **Repos**.
+2. Click **Add Repo**.
+3. Enter the URL: `https://github.com/wang-yuhao/databricks-eeg-lakehouse-lab.git`.
+4. Leave **Branch** as `main` and click **Create Repo**.
+
+### 4. Create a Unity Catalog–Enabled Cluster
+
+1. In the left sidebar, click **Compute** > **Create compute**.
+2. Apply the following configuration.
+
+| Parameter | Value |
+|---|---|
+| Cluster name | `eeg-lab-cluster` |
+| Cluster mode | Single node |
+| Databricks Runtime | **14.3 LTS** (Scala 2.12, Spark 3.5) |
+| Node type | `Standard_DS3_v2` (Azure) or equivalent |
+| Terminate after | 60 minutes of inactivity |
+| Unity Catalog | Enabled — set **Access mode** to **Single user** |
+
+3. Under **Advanced options** > **Spark**, add:
+
+```
+spark.sql.extensions io.delta.sql.DeltaSparkSessionExtension
+spark.sql.catalog.spark_catalog org.apache.spark.sql.delta.catalog.DeltaCatalog
+```
+
+4. Click **Create compute** and wait for the status to show **Running**.
+
+### 5. Install Required Libraries
+
+Select the cluster, open the **Libraries** tab, click **Install new**, and add the following.
+
+| Source | Package |
+|---|---|
+| PyPI | `mne==1.7.0` |
+| PyPI | `scipy==1.13.0` |
+| PyPI | `numpy==1.26.4` |
+| PyPI | `matplotlib==3.9.0` |
+| PyPI | `seaborn==0.13.2` |
+
+Wait for each library to show status **Installed** before proceeding.
+
+### 6. Open and Attach the Notebook
+
+1. In the left sidebar, click **Repos** and navigate to `wang-yuhao/databricks-eeg-lakehouse-lab/notebooks/`.
+2. Click `day06_gold_features.py` to open it.
+3. In the notebook toolbar, click the cluster dropdown and select `eeg-lab-cluster`.
+4. Confirm the cluster indicator turns green.
 
 ---
 
 ## Objectives
 
-- Build Gold layer aggregated features per subject
-- Compute sleep stage distributions (% N1, N2, N3, REM, Wake)
-- Calculate band power statistics (mean, std, percentiles)
-- Create time-series features (sleep fragmentation, transitions)
-- Write Gold table for downstream TDA (Topological Data Analysis)
-- Validate data quality with assertions
+- Build a Gold layer of aggregated, per-subject features from Silver epoch data.
+- Compute sleep stage distributions (percentage of time in Wake, N1, N2, N3, REM).
+- Calculate band power statistics (mean, standard deviation, quartile percentiles).
+- Measure artifact rate per subject.
+- Quantify sleep fragmentation using window functions.
+- Write the Gold Delta table and validate it with programmatic assertions.
 
 ---
 
 ## Background
 
-**Why Gold layer?**
+The Gold layer collapses millions of epoch-level Silver rows into one analysis-ready row per subject. This compression supports both machine learning classification and exploratory reporting.
 
-The Gold layer aggregates Silver data into **analysis-ready features**. In this project:
-
-- **Silver** = EEG epochs (30-second windows) → millions of rows
-- **Gold** = Per-subject aggregates (1 row per subject) → hundreds of rows
-
-Gold features will be used for:
-
-1. **Machine Learning** (predict sleep disorders)
-2. **Topological Data Analysis** (TDA) to detect sleep patterns
-3. **Dashboards and reporting**
-
-**Key aggregations:**
-
-| Feature type | Example | SQL function |
+| Aggregation type | Example metric | Spark function |
 |---|---|---|
-| Sleep stage distribution | % time in N3 (deep sleep) | `count(*) filter(where sleep_stage = 'N3') / count(*)` |
-| Band power statistics | Mean delta power | `avg(delta_power)` |
-| Artifact rate | % of epochs with artifacts | `count(*) filter(where is_artifact = true) / count(*)` |
-| Sleep fragmentation | Number of stage transitions | `count(distinct epoch_idx) - 1` where stage changes |
-| Percentiles | 75th percentile of sigma power | `percentile_approx(sigma_power, 0.75)` |
+| Sleep stage distribution | Percentage of epochs in N3 | `count(*) filter(where sleep_stage = 'N3') / count(*)` |
+| Band power — central tendency | Mean delta power per subject | `avg(delta_power)` |
+| Band power — spread | Standard deviation of sigma power | `stddev(sigma_power)` |
+| Band power — percentiles | 75th percentile of sigma power | `percentile_approx(sigma_power, 0.75)` |
+| Artifact rate | Fraction of epochs flagged as artefacts | `count(*) filter(where is_artifact = true) / count(*)` |
+| Sleep fragmentation | Number of sleep stage transitions | `lag()` window + conditional count |
 
-**Exam tip:**
-
-- Use `F.expr("count(*) filter(where ...)")` for filtered aggregations (Spark 3.0+)
-- Use `F.percentile_approx()` for large datasets (exact percentile is slow)
+> **Exam tip**: Use `F.expr("count(*) filter(where ...)")` to perform multiple conditional aggregations in a single data pass. Use `percentile_approx()` instead of `percentile()` on large datasets — the approximation introduces less than 1 % error while being significantly faster.
 
 ---
 
 ## Step-by-Step Instructions
 
-### Step 1 — Open the notebook
-
-1. Go to Databricks Workspace
-2. Open `notebooks/day06_gold_features.py`
-3. Attach to your cluster
-
----
-
-### Step 2 — Run Cell 1: Load Silver table
+### Step 1 — Define constants and load Silver table
 
 ```python
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 from delta.tables import DeltaTable
 
-# Load Silver table
-silver_df = spark.read.table("eeg_lakehouse.silver.cleaned_epochs")
+SILVER_TABLE = "eeg_lakehouse.silver.cleaned_epochs"
+GOLD_PATH    = "dbfs:/eeg_lakehouse/gold/subject_features"
+GOLD_TABLE   = "eeg_lakehouse.gold.subject_features"
 
-print(f"Silver table record count: {silver_df.count()}")
+silver_df = spark.read.table(SILVER_TABLE)
+
+print(f"Silver record count : {silver_df.count()}")
 silver_df.printSchema()
 ```
 
-**Expected output:**
+**Expected output**:
 
 ```
-Silver table record count: 15000
+Silver record count : 15000
 root
- |-- subject_id: string
- |-- epoch_idx: integer
- |-- sleep_stage: string
- |-- sigma_power: double
- |-- delta_power: double
- |-- is_artifact: boolean
- |-- signal_blob: binary
+ |-- subject_id: string (nullable = true)
+ |-- epoch_idx: integer (nullable = true)
+ |-- sleep_stage: string (nullable = true)
+ |-- sigma_power: double (nullable = true)
+ |-- delta_power: double (nullable = true)
+ |-- is_artifact: boolean (nullable = true)
+ |-- signal_blob: binary (nullable = true)
 ```
 
 ---
 
-### Step 3 — Run Cell 2: Compute sleep stage distribution
+### Step 2 — Compute sleep stage distribution
 
 ```python
-# Aggregate sleep stage counts per subject
 sleep_dist = (
     silver_df
     .groupBy("subject_id")
     .agg(
         F.count("*").alias("total_epochs"),
         F.expr("count(*) filter(where sleep_stage = 'Wake')").alias("wake_count"),
-        F.expr("count(*) filter(where sleep_stage = 'N1')").alias("n1_count"),
-        F.expr("count(*) filter(where sleep_stage = 'N2')").alias("n2_count"),
-        F.expr("count(*) filter(where sleep_stage = 'N3')").alias("n3_count"),
+        F.expr("count(*) filter(where sleep_stage = 'N1')" ).alias("n1_count"),
+        F.expr("count(*) filter(where sleep_stage = 'N2')" ).alias("n2_count"),
+        F.expr("count(*) filter(where sleep_stage = 'N3')" ).alias("n3_count"),
         F.expr("count(*) filter(where sleep_stage = 'REM')").alias("rem_count"),
     )
-    # Compute percentages
-    .withColumn("wake_pct", F.col("wake_count") / F.col("total_epochs") * 100)
-    .withColumn("n1_pct", F.col("n1_count") / F.col("total_epochs") * 100)
-    .withColumn("n2_pct", F.col("n2_count") / F.col("total_epochs") * 100)
-    .withColumn("n3_pct", F.col("n3_count") / F.col("total_epochs") * 100)
-    .withColumn("rem_pct", F.col("rem_count") / F.col("total_epochs") * 100)
+    .withColumn("wake_pct", F.round(F.col("wake_count") / F.col("total_epochs") * 100, 2))
+    .withColumn("n1_pct",   F.round(F.col("n1_count")   / F.col("total_epochs") * 100, 2))
+    .withColumn("n2_pct",   F.round(F.col("n2_count")   / F.col("total_epochs") * 100, 2))
+    .withColumn("n3_pct",   F.round(F.col("n3_count")   / F.col("total_epochs") * 100, 2))
+    .withColumn("rem_pct",  F.round(F.col("rem_count")  / F.col("total_epochs") * 100, 2))
+    .drop("wake_count", "n1_count", "n2_count", "n3_count", "rem_count")
 )
 
-sleep_dist.show(5)
+sleep_dist.show(5, truncate=False)
 ```
 
-**Expected output:**
+**Expected output**:
 
 ```
-+----------+------------+----------+--------+--------+--------+---------+--------+------+------+------+-------+
-|subject_id|total_epochs|wake_count|n1_count|n2_count|n3_count|rem_count|wake_pct|n1_pct|n2_pct|n3_pct|rem_pct|
-+----------+------------+----------+--------+--------+--------+---------+--------+------+------+------+-------+
-|001       |100         |10        |15      |40      |20      |15       |10.0    |15.0  |40.0  |20.0  |15.0   |
-|002       |100         |8         |12      |45      |18      |17       |8.0     |12.0  |45.0  |18.0  |17.0   |
-...
++----------+------------+--------+------+------+------+-------+
+|subject_id|total_epochs|wake_pct|n1_pct|n2_pct|n3_pct|rem_pct|
++----------+------------+--------+------+------+------+-------+
+|001       |300         |10.0    |15.0  |40.0  |20.0  |15.0   |
+|002       |300         |8.0     |12.0  |45.0  |18.0  |17.0   |
 ```
-
-**Interpretation:**
-
-- Subject 001 spends 20% of time in N3 (deep sleep) → healthy
-- Wake % > 20% → possible insomnia
 
 ---
 
-### Step 4 — Run Cell 3: Compute band power statistics
+### Step 3 — Compute band power statistics
 
 ```python
-# Aggregate band power features per subject
 band_power_stats = (
     silver_df
-    .filter(F.col("is_artifact") == False)  # Exclude artifacts
+    .filter(F.col("is_artifact") == False)
     .groupBy("subject_id")
     .agg(
-        F.mean("sigma_power").alias("sigma_mean"),
-        F.stddev("sigma_power").alias("sigma_std"),
-        F.expr("percentile_approx(sigma_power, 0.25)").alias("sigma_p25"),
-        F.expr("percentile_approx(sigma_power, 0.50)").alias("sigma_p50"),
-        F.expr("percentile_approx(sigma_power, 0.75)").alias("sigma_p75"),
-        F.mean("delta_power").alias("delta_mean"),
-        F.stddev("delta_power").alias("delta_std"),
-        F.expr("percentile_approx(delta_power, 0.25)").alias("delta_p25"),
-        F.expr("percentile_approx(delta_power, 0.50)").alias("delta_p50"),
-        F.expr("percentile_approx(delta_power, 0.75)").alias("delta_p75"),
+        F.round(F.mean("sigma_power"),   4).alias("sigma_mean"),
+        F.round(F.stddev("sigma_power"), 4).alias("sigma_std"),
+        F.round(F.expr("percentile_approx(sigma_power, 0.25)"), 4).alias("sigma_p25"),
+        F.round(F.expr("percentile_approx(sigma_power, 0.50)"), 4).alias("sigma_p50"),
+        F.round(F.expr("percentile_approx(sigma_power, 0.75)"), 4).alias("sigma_p75"),
+        F.round(F.mean("delta_power"),   4).alias("delta_mean"),
+        F.round(F.stddev("delta_power"), 4).alias("delta_std"),
+        F.round(F.expr("percentile_approx(delta_power, 0.25)"), 4).alias("delta_p25"),
+        F.round(F.expr("percentile_approx(delta_power, 0.50)"), 4).alias("delta_p50"),
+        F.round(F.expr("percentile_approx(delta_power, 0.75)"), 4).alias("delta_p75"),
     )
 )
 
-band_power_stats.show(5)
+band_power_stats.show(5, truncate=False)
 ```
 
-**Expected output:**
-
-```
-+----------+----------+---------+--------+--------+--------+----------+---------+--------+--------+--------+
-|subject_id|sigma_mean|sigma_std|sigma_p25|sigma_p50|sigma_p75|delta_mean|delta_std|delta_p25|delta_p50|delta_p75|
-+----------+----------+---------+--------+--------+--------+----------+---------+--------+--------+--------+
-|001       |4.2       |2.1      |2.8     |3.9     |5.1     |12.5      |6.3      |8.2     |11.0    |15.3    |
-|002       |3.8       |1.9      |2.5     |3.6     |4.8     |11.8      |5.9      |7.8     |10.5    |14.1    |
-...
-```
-
-**Why exclude artifacts?**
-
-- Artifacts skew mean/std calculations
-- Filter `is_artifact = False` before aggregation
+Artifact epochs are excluded before aggregation because they contain corrupted signal amplitudes that inflate mean and standard deviation estimates.
 
 ---
 
-### Step 5 — Run Cell 4: Compute artifact rate
+### Step 4 — Compute artifact rate
 
 ```python
-# Artifact rate per subject
 artifact_rate = (
     silver_df
     .groupBy("subject_id")
     .agg(
-        F.expr("count(*) filter(where is_artifact = true)").alias("artifact_count"),
         F.count("*").alias("total_epochs"),
+        F.expr("count(*) filter(where is_artifact = true)").alias("artifact_count"),
     )
-    .withColumn("artifact_rate", F.col("artifact_count") / F.col("total_epochs"))
+    .withColumn(
+        "artifact_rate",
+        F.round(F.col("artifact_count") / F.col("total_epochs"), 4)
+    )
+    .select("subject_id", "artifact_rate")
 )
 
-artifact_rate.show(5)
+artifact_rate.show(5, truncate=False)
 ```
 
-**Expected output:**
-
-```
-+----------+--------------+------------+-------------+
-|subject_id|artifact_count|total_epochs|artifact_rate|
-+----------+--------------+------------+-------------+
-|001       |5             |100         |0.05         |
-|002       |8             |100         |0.08         |
-...
-```
-
-**Quality check:**
-
-- Artifact rate > 20% → poor data quality, exclude subject
+**Interpretation**: A subject with `artifact_rate > 0.20` has poor signal quality and should be excluded from downstream analysis.
 
 ---
 
-### Step 6 — Run Cell 5: Compute sleep fragmentation
+### Step 5 — Compute sleep fragmentation
 
 ```python
-from pyspark.sql.window import Window
-
-# Add lag column to detect stage transitions
 window_spec = Window.partitionBy("subject_id").orderBy("epoch_idx")
 
-transitions_df = (
+fragmentation = (
     silver_df
     .withColumn("prev_stage", F.lag("sleep_stage").over(window_spec))
-    .withColumn("is_transition", F.col("sleep_stage") != F.col("prev_stage"))
-)
-
-# Count transitions per subject
-fragmentation = (
-    transitions_df
-    .filter(F.col("is_transition") == True)
+    .withColumn(
+        "is_transition",
+        (F.col("sleep_stage") != F.col("prev_stage")) & F.col("prev_stage").isNotNull()
+    )
     .groupBy("subject_id")
     .agg(
-        F.count("*").alias("transition_count"),
+        F.sum(F.col("is_transition").cast("int")).alias("transition_count")
     )
 )
 
-fragmentation.show(5)
+fragmentation.show(5, truncate=False)
 ```
 
-**Expected output:**
+**Expected output**:
 
 ```
 +----------+----------------+
 |subject_id|transition_count|
 +----------+----------------+
 |001       |15              |
-|002       |20              |
-...
+|002       |22              |
 ```
 
-**Interpretation:**
-
-- High transition count → fragmented sleep (possible sleep disorder)
-- Low transition count → stable sleep stages
+A high `transition_count` indicates fragmented sleep, which is associated with sleep disorders such as insomnia or sleep apnoea.
 
 ---
 
-### Step 7 — Run Cell 6: Join all features into Gold table
+### Step 6 — Join all features into the Gold DataFrame
 
 ```python
-# Join all aggregated features
 gold_df = (
     sleep_dist
     .join(band_power_stats, on="subject_id", how="inner")
-    .join(artifact_rate.select("subject_id", "artifact_rate"), on="subject_id", how="inner")
-    .join(fragmentation, on="subject_id", how="inner")
-    # Drop intermediate count columns
-    .drop("wake_count", "n1_count", "n2_count", "n3_count", "rem_count", "artifact_count")
+    .join(artifact_rate,    on="subject_id", how="inner")
+    .join(fragmentation,    on="subject_id", how="inner")
 )
 
-print(f"Gold table record count: {gold_df.count()}")
+print(f"Gold record count: {gold_df.count()}")
 gold_df.printSchema()
 gold_df.show(5, truncate=False)
 ```
 
-**Expected output:**
+**Expected output**:
 
 ```
-Gold table record count: 50
+Gold record count: 50
 root
  |-- subject_id: string
  |-- total_epochs: long
@@ -302,139 +312,124 @@ root
 
 ---
 
-### Step 8 — Run Cell 7: Write Gold table to Delta
+### Step 7 — Write the Gold Delta table
 
 ```python
-# Write Gold table
-gold_path = "dbfs:/eeg_lakehouse/gold/subject_features"
-
 (
     gold_df
     .write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .save(gold_path)
+    .save(GOLD_PATH)
 )
 
-# Register as table
-spark.sql("CREATE DATABASE IF NOT EXISTS eeg_lakehouse")
+spark.sql("CREATE CATALOG IF NOT EXISTS eeg_lakehouse")
+spark.sql("CREATE DATABASE IF NOT EXISTS eeg_lakehouse.gold")
 spark.sql(f"""
-    CREATE TABLE IF NOT EXISTS eeg_lakehouse.gold.subject_features
+    CREATE TABLE IF NOT EXISTS {GOLD_TABLE}
     USING DELTA
-    LOCATION '{gold_path}'
+    LOCATION '{GOLD_PATH}'
 """)
 
-print("✓ Gold table written")
-```
-
-**Expected output:**
-
-```
-✓ Gold table written
+print(f"Gold table written to {GOLD_PATH} and registered as {GOLD_TABLE}.")
 ```
 
 ---
 
-### Step 9 — Run Cell 8: Data quality assertions
+### Step 8 — Run data quality assertions
 
 ```python
-# Assertion 1: All percentages sum to ~100%
-for row in gold_df.select("subject_id", "wake_pct", "n1_pct", "n2_pct", "n3_pct", "rem_pct").collect():
+rows = gold_df.select(
+    "subject_id", "wake_pct", "n1_pct", "n2_pct", "n3_pct", "rem_pct", "artifact_rate"
+).collect()
+
+# Assertion 1: Stage percentages must sum to approximately 100 %
+for row in rows:
     total_pct = row.wake_pct + row.n1_pct + row.n2_pct + row.n3_pct + row.rem_pct
-    assert 99 < total_pct < 101, f"Subject {row.subject_id} stage percentages don't sum to 100%: {total_pct}"
+    assert 99.0 < total_pct < 101.0, (
+        f"Subject {row.subject_id}: stage percentages sum to {total_pct:.2f}, expected ~100."
+    )
+print("PASS — Stage percentages sum to 100 % for all subjects.")
 
-print("✓ PASS: Stage percentages sum to 100%")
+# Assertion 2: Artifact rate must be below the 20 % threshold
+for row in rows:
+    assert row.artifact_rate < 0.20, (
+        f"Subject {row.subject_id}: artifact rate {row.artifact_rate:.1%} exceeds 20 % threshold."
+    )
+print("PASS — Artifact rate is within the acceptable range for all subjects.")
 
-# Assertion 2: Artifact rate < 20%
-max_artifact_rate = gold_df.agg(F.max("artifact_rate")).collect()[0][0]
-assert max_artifact_rate < 0.20, f"FAIL: Max artifact rate {max_artifact_rate:.1%} exceeds 20%"
-
-print("✓ PASS: Artifact rate acceptable")
-
-# Assertion 3: No null values in key features
+# Assertion 3: No null values in any Gold column
 null_counts = gold_df.select(
     [F.sum(F.col(c).isNull().cast("int")).alias(c) for c in gold_df.columns]
 ).collect()[0].asDict()
 
-for col, null_count in null_counts.items():
-    assert null_count == 0, f"FAIL: Column {col} has {null_count} null values"
-
-print("✓ PASS: No null values in Gold table")
+for col_name, null_count in null_counts.items():
+    assert null_count == 0, (
+        f"Column '{col_name}' contains {null_count} null value(s)."
+    )
+print("PASS — No null values detected in the Gold table.")
 ```
 
-**Expected output:**
+**Expected output**:
 
 ```
-✓ PASS: Stage percentages sum to 100%
-✓ PASS: Artifact rate acceptable
-✓ PASS: No null values in Gold table
+PASS — Stage percentages sum to 100 % for all subjects.
+PASS — Artifact rate is within the acceptable range for all subjects.
+PASS — No null values detected in the Gold table.
 ```
 
 ---
 
-### Step 10 — Run Cell 9: Descriptive statistics
+### Step 9 — Summary statistics
 
 ```python
-# Show summary statistics
 gold_df.select(
     "wake_pct", "n3_pct", "sigma_mean", "delta_mean", "artifact_rate", "transition_count"
-).describe().show()
+).describe().show(truncate=False)
 ```
 
-**Expected output:**
+**Expected output**:
 
 ```
-+-------+--------+-------+----------+----------+-------------+----------------+
-|summary|wake_pct|n3_pct |sigma_mean|delta_mean|artifact_rate|transition_count|
-+-------+--------+-------+----------+----------+-------------+----------------+
-|count  |50      |50     |50        |50        |50           |50              |
-|mean   |12.5    |18.3   |4.1       |12.2      |0.08         |17.5            |
-|stddev |5.2     |6.1    |1.2       |3.4       |0.04         |5.2             |
-|min    |5.0     |8.0    |2.1       |7.5       |0.02         |8               |
-|max    |25.0    |30.0   |7.2       |20.5      |0.18         |32              |
-+-------+--------+-------+----------+----------+-------------+----------------+
++-------+--------+------+----------+----------+-------------+----------------+
+|summary|wake_pct|n3_pct|sigma_mean|delta_mean|artifact_rate|transition_count|
++-------+--------+------+----------+----------+-------------+----------------+
+|count  |50      |50    |50        |50        |50           |50              |
+|mean   |12.5    |18.3  |4.1       |12.2      |0.08         |17.5            |
+|stddev |5.2     |6.1   |1.2       |3.4       |0.04         |5.2             |
+|min    |5.0     |8.0   |2.1       |7.5       |0.02         |8               |
+|max    |25.0    |30.0  |7.2       |20.5      |0.18         |32              |
++-------+--------+------+----------+----------+-------------+----------------+
 ```
 
 ---
 
-### Step 11 — Run Cell 10: Visualize distributions (optional)
+### Step 10 — Visualise feature distributions
 
 ```python
-# Create Pandas DataFrame for plotting
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 gold_pd = gold_df.toPandas()
 
-fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+fig.suptitle("Gold Layer — Subject Feature Distributions", fontsize=14)
 
-# Sleep stage distributions
-axes[0, 0].hist(gold_pd["wake_pct"], bins=20, color="orange")
-axes[0, 0].set_title("Wake %")
-axes[0, 0].set_xlabel("Percentage")
+plot_config = [
+    ("wake_pct",        "Wake %",                "orange"),
+    ("n3_pct",          "N3 (Deep Sleep) %",     "steelblue"),
+    ("rem_pct",         "REM %",                  "mediumpurple"),
+    ("sigma_mean",      "Mean Sigma Power (µV²)", "seagreen"),
+    ("delta_mean",      "Mean Delta Power (µV²)", "tomato"),
+    ("transition_count","Sleep Stage Transitions","slategray"),
+]
 
-axes[0, 1].hist(gold_pd["n3_pct"], bins=20, color="blue")
-axes[0, 1].set_title("N3 (Deep Sleep) %")
-axes[0, 1].set_xlabel("Percentage")
-
-axes[0, 2].hist(gold_pd["rem_pct"], bins=20, color="purple")
-axes[0, 2].set_title("REM %")
-axes[0, 2].set_xlabel("Percentage")
-
-# Band power
-axes[1, 0].hist(gold_pd["sigma_mean"], bins=20, color="green")
-axes[1, 0].set_title("Mean Sigma Power")
-axes[1, 0].set_xlabel("Power (µV²)")
-
-axes[1, 1].hist(gold_pd["delta_mean"], bins=20, color="red")
-axes[1, 1].set_title("Mean Delta Power")
-axes[1, 1].set_xlabel("Power (µV²)")
-
-# Sleep fragmentation
-axes[1, 2].hist(gold_pd["transition_count"], bins=20, color="gray")
-axes[1, 2].set_title("Sleep Stage Transitions")
-axes[1, 2].set_xlabel("Count")
+for ax, (col, title, colour) in zip(axes.flat, plot_config):
+    ax.hist(gold_pd[col], bins=20, color=colour, edgecolor="white")
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel(title)
+    ax.set_ylabel("Subjects")
 
 plt.tight_layout()
 plt.show()
@@ -442,35 +437,35 @@ plt.show()
 
 ---
 
-## Self-Check: Answer Exam Reflection Questions
+## Exam Reflection Questions
 
-1. Why use `F.expr("count(*) filter(where ...)")` instead of two separate `groupBy()` calls?
-2. What is the difference between `percentile()` and `percentile_approx()`?
-3. Why exclude artifacts before computing band power statistics?
-4. How do you detect sleep stage transitions using window functions?
-5. What are the key quality checks for the Gold table?
+1. Why does `count(*) filter(where ...)` outperform a separate `groupBy().agg()` for each sleep stage?
+2. What is the difference between `percentile()` and `percentile_approx()`, and why does the latter scale better?
+3. Why are artifact epochs excluded before computing band power statistics?
+4. How does the `lag()` window function detect sleep stage transitions?
+5. Name three data quality checks that are appropriate for a Gold layer.
 6. Why does the Gold table have far fewer rows than the Silver table?
 
-**Answers:**
+**Reference answers**:
 
-1. `filter(where ...)` computes multiple conditional aggregations in a single pass over the data. Separate `groupBy()` calls would scan the data multiple times.
-2. `percentile()` is exact but slow (requires sorting). `percentile_approx()` uses sketching algorithms (t-digest) and is ~10x faster for large datasets with <1% error.
-3. Artifacts are outliers that skew mean and standard deviation. Excluding them gives more accurate statistics for normal EEG signal.
-4. Use `lag()` window function to get previous stage, then compare `sleep_stage != prev_stage` to detect transitions.
-5. (1) Stage percentages sum to 100%, (2) Artifact rate < 20%, (3) No null values in key features, (4) N3% and REM% are reasonable (10-25%).
-6. Gold aggregates per subject (1 row per subject). Silver has per-epoch data (100s of epochs per subject).
+1. `filter(where ...)` computes all conditional counts in a single full-table scan. A separate `groupBy()` per stage requires one scan per stage, multiplying I/O cost.
+2. `percentile()` sorts all values to compute exact quantiles, which is O(n log n). `percentile_approx()` uses the t-digest sketch algorithm and runs in a single pass with less than 1 % error, making it suitable for millions of rows.
+3. Artifact epochs contain clipped or saturated signal amplitudes that are outliers relative to true EEG. Including them inflates the mean and inflates the standard deviation, producing misleading feature values.
+4. `lag("sleep_stage").over(window)` retrieves the stage from the previous epoch. Comparing the current stage to the lagged stage yields a Boolean `is_transition` flag. Summing those flags gives the total transition count.
+5. Stage percentages sum to 100 %; artifact rate below a threshold; no null values in key feature columns.
+6. Silver stores one row per 30-second epoch, yielding hundreds of rows per subject. Gold aggregates all epochs into exactly one summary row per subject.
 
 ---
 
-## Day 6 Summary
+## Day 6 Operation Reference
 
-| What was built | Feature type | SQL function |
+| Operation | Function | Notes |
 |---|---|---|
-| Sleep stage distribution | Wake%, N1%, N2%, N3%, REM% | `count(*) filter(where ...)` |
-| Band power statistics | Mean, std, percentiles (sigma, delta) | `avg()`, `stddev()`, `percentile_approx()` |
-| Artifact rate | % of epochs with artifacts | `count(*) filter(where is_artifact = true)` |
-| Sleep fragmentation | Number of stage transitions | `lag()` window function + `count(*)` |
-| Gold Delta table | Per-subject aggregates | `write.format("delta").mode("overwrite")` |
-| Data quality assertions | Null checks, percentage sums | Python `assert` statements |
+| Filtered aggregation | `count(*) filter(where ...)` | Single-pass; preferred over multiple `groupBy()` calls |
+| Approximate percentile | `percentile_approx(col, q)` | < 1 % error; O(n) complexity |
+| Window lag | `F.lag("col").over(window)` | Requires `partitionBy` and `orderBy` |
+| Inner join | `df.join(other, on="key", how="inner")` | Drops subjects absent from either side |
+| Delta write | `.write.format("delta").mode("overwrite")` | Overwrites data; preserves history |
+| Programmatic assertion | `assert condition, message` | Raises `AssertionError` on failure |
 
-**Next**: Day 7 explores Delta Live Tables (DLT) for orchestrating the Bronze → Silver → Gold pipeline with auto-recovery and data quality constraints.
+**Next**: Day 7 orchestrates the complete Bronze → Silver → Gold pipeline using Delta Live Tables, with declarative data quality constraints and auto-recovery.
