@@ -1,19 +1,20 @@
 # Day 2: Dataset Interface & Bronze Schema Design
 
-**Notebook**: `notebooks/day02_bronze_schema_design.py`  
-**Source modules**: `src/bronze/ingest_eeg_files.py`, `src/utils/config.py`  
-**Exam domains**: Auto Loader (Domain 3 — Incremental Processing), Delta schema enforcement (Domain 1 — Lakehouse Platform)  
-**Time estimate**: 2–3 hours  
-**Prerequisite**: Day 1 completed; Databricks workspace with Unity Catalog enabled
+**Notebook**: `notebooks/day02_bronze_schema_design.py`
+**Source modules**: `src/bronze/ingest_eeg_files.py`, `src/utils/config.py`
+**Exam domains**: Auto Loader (Domain 3 — Incremental Processing), Delta schema enforcement (Domain 1 — Lakehouse Platform)
+**Time estimate**: 2–3 hours
+**Prerequisite**: Day 1 completed; Databricks workspace with Unity Catalog enabled and the repository cloned into Databricks Repos
 
 ---
 
 ## Objectives
 
-- Understand the PhysioNet Sleep-EDF EDF file format and naming convention
-- Design explicit Bronze schemas (know why explicit > inferSchema)
-- Preview Auto Loader options for incremental EDF ingestion
-- Apply `extract_subject_id` logic and verify it works
+- Connect this GitHub repository to Databricks Repos and open the Day 2 notebook from within the workspace
+- Understand the PhysioNet Sleep-EDF EDF file format and its naming convention
+- Design and inspect explicit Bronze schemas, and understand why explicit schemas outperform `inferSchema`
+- Explore Auto Loader configuration options for incremental EDF ingestion
+- Apply and verify the `extract_subject_id` parsing logic against test filenames
 
 ---
 
@@ -22,29 +23,145 @@
 The Bronze layer in this project is a **metadata registry only** — it stores file-level metadata parsed from EDF filenames, not raw EEG signal samples. Raw EDF binary content is processed later in Silver via Pandas UDFs with MNE-Python. The Bronze table acts as the ingestion audit log and enables idempotent incremental loading via Auto Loader checkpoints.
 
 Sleep-EDF filename convention: `SC4001E0-PSG.edf`
-- `SC` = Sleep Cassette (hospital), `ST` = Sleep Telemetry (home)
-- `40` = subject age
-- `01` = subject number
-- `E0` = study night 0, `E1` = study night 1, `EC` = cassette (hypnogram)
-- `PSG` = polysomnography signal, `Hypnogram` = sleep stage annotations
+
+| Segment | Meaning |
+|---|---|
+| `SC` | Sleep Cassette (hospital recording) |
+| `ST` | Sleep Telemetry (home recording) |
+| `40` | Subject age |
+| `01` | Subject number |
+| `E0` / `E1` | Study night 0 or 1 |
+| `EC` | Hypnogram cassette |
+| `PSG` | Polysomnography signal file |
+| `Hypnogram` | Sleep stage annotation file |
 
 ---
 
-## Step-by-Step Instructions
+## Environment Setup: Connect the Repository to Databricks Repos
 
-### Step 1 — Open the notebook
+> **Important**: Complete this section before proceeding to any notebook steps. All instructions below assume you are running code inside a Databricks notebook that has been opened via Repos.
 
-1. In Databricks Workspace, navigate to **Repos** > your repo > `notebooks/`
-2. Open `day02_bronze_schema_design.py`
-3. Attach the notebook to a cluster with **Unity Catalog enabled** (DBR 13.3 LTS or higher)
-4. Confirm the cluster has `mne`, `pyedflib`, and `scipy` installed (check `requirements.txt`)
+### Step A — Prerequisites Check
+
+Before connecting the repository, confirm the following:
+
+1. You have a Databricks workspace provisioned (Azure Databricks, AWS, or GCP Databricks).
+2. Unity Catalog is enabled on your workspace. Verify this by navigating to **Catalog** in the left sidebar — you should see your catalog hierarchy (`eeg_lakehouse` or equivalent).
+3. You have a personal access token (PAT) for GitHub, or your GitHub account is connected via OAuth.
+4. Git is accessible from your workspace (it is included by default in all Databricks workspaces).
 
 ---
 
-### Step 2 — Run Cell 1: Explore AppConfig
+### Step B — Generate a GitHub Personal Access Token (PAT)
+
+If you have already connected GitHub via OAuth in a previous session, skip to Step C.
+
+1. In your browser, navigate to [https://github.com/settings/tokens](https://github.com/settings/tokens).
+2. Click **Generate new token (classic)**.
+3. Set a descriptive name, e.g. `databricks-repos-access`.
+4. Set the expiry to at least 90 days.
+5. Under **Scopes**, select:
+   - `repo` (full repository access — required to read and write code)
+6. Click **Generate token** and copy the token immediately. You will not be able to see it again.
+
+---
+
+### Step C — Connect GitHub to Databricks via Git Integration
+
+1. In your Databricks workspace, click your **username** in the top-right corner.
+2. Select **User Settings** from the dropdown.
+3. Navigate to the **Linked Accounts** tab (or **Git Integration** tab, depending on your Databricks version).
+4. Under **Git provider**, select `GitHub`.
+5. In the **Token** field, paste the PAT you generated in Step B.
+6. Click **Save**. A green confirmation message should appear.
+
+> **Databricks Runtime 14.3+ note**: In newer workspaces, Git integration may be managed under **Settings > Developer Settings > Git credentials**. The steps are equivalent.
+
+---
+
+### Step D — Add the Repository to Databricks Repos
+
+1. In the left sidebar, click **Workspace**.
+2. Navigate to the **Repos** section (it appears as a folder icon labelled `Repos` under your username, e.g. `Repos / your-email@example.com /`).
+3. Click the **Add Repo** button (top-right of the Repos panel, or via **+** icon).
+4. In the dialog that appears:
+   - **Git repository URL**: `https://github.com/wang-yuhao/databricks-eeg-lakehouse-lab.git`
+   - **Git provider**: `GitHub`
+   - **Repo name** (optional override): `databricks-eeg-lakehouse-lab`
+5. Click **Create Repo**.
+6. Databricks will clone the repository. Once complete, you will see the folder structure:
+   ```
+   Repos/
+   └── your-email@example.com/
+       └── databricks-eeg-lakehouse-lab/
+           ├── notebooks/
+           ├── src/
+           ├── docs/
+           └── ...
+   ```
+
+> If you encounter an authentication error, return to Step C and verify the PAT is saved correctly.
+
+---
+
+### Step E — Create or Attach a Unity-Catalog-Enabled Cluster
+
+1. In the left sidebar, navigate to **Compute**.
+2. Click **Create Compute** (or **New Cluster** in older UI versions).
+3. Configure the cluster as follows:
+
+   | Setting | Recommended Value |
+   |---|---|
+   | **Cluster name** | `eeg-lab-cluster` |
+   | **Cluster mode** | Single-node (for Day 2 exploration) or Standard |
+   | **Databricks Runtime** | `14.3 LTS (Scala 2.12, Spark 3.5.0)` or higher |
+   | **Node type** | `Standard_DS3_v2` (Azure) or equivalent — 14 GB RAM, 4 cores |
+   | **Unity Catalog** | Enabled (this is the default for DBR 13.3+) |
+   | **Auto-termination** | 30 minutes |
+
+4. Under **Advanced Options > Spark**, add the following environment variable to ensure Unity Catalog catalog defaults are loaded correctly:
+
+   ```
+   DATABRICKS_ENV=dev
+   AUTOLOADER_CHECKPOINT=/Volumes/eeg_lakehouse/bronze/checkpoints/autoloader
+   ```
+
+5. Under **Libraries**, click **Install New** and add the following PyPI packages one at a time (or upload `requirements.txt`):
+
+   | Library | Version |
+   |---|---|
+   | `mne` | `1.6.1` |
+   | `pyedflib` | `0.1.34` |
+   | `scipy` | `1.12.0` |
+   | `yasa` | `0.6.4` |
+
+   Alternatively, attach the entire `requirements.txt` from the repo root by selecting **File** > Upload and pointing to `requirements.txt`.
+
+6. Click **Create Cluster** and wait for the cluster to reach **Running** state (typically 3–5 minutes).
+
+---
+
+### Step F — Open the Day 2 Notebook
+
+1. In the left sidebar, navigate to **Workspace > Repos > your-email@example.com > databricks-eeg-lakehouse-lab > notebooks**.
+2. Click **day02_bronze_schema_design.py** to open it.
+3. In the top-right of the notebook, click the **Connect** dropdown and select the cluster you created in Step E (`eeg-lab-cluster`).
+4. Wait for the cluster indicator to turn green (Connected).
+
+You are now ready to execute the notebook cells in order.
+
+---
+
+## Step-by-Step Notebook Instructions
+
+### Step 1 — Run Cell 1: Validate the AppConfig Object
+
+This cell imports the project configuration module and prints all key paths and catalog names that will be used throughout the pipeline.
 
 ```python
 import sys, os
+
+# Add the repository root to the Python path so that src/ modules are importable
 sys.path.insert(0, os.path.join(os.getcwd(), ".."))
 
 from src.utils.config import AppConfig
@@ -56,24 +173,41 @@ from src.bronze.ingest_eeg_files import (
 )
 
 cfg = AppConfig()
-print("Catalog:", cfg.catalog.catalog)
-print("Bronze EDF FQN:", cfg.catalog.bronze_edf_fqn)
-print("Bronze Metadata FQN:", cfg.catalog.bronze_metadata_fqn)
-print("Volume EDF path:", cfg.paths.volume_edf_dir)
-print("Auto Loader checkpoint:", cfg.paths.autoloader_checkpoint)
+
+print("=== Unity Catalog Configuration ===")
+print(f"  Catalog         : {cfg.catalog.catalog}")
+print(f"  Bronze EDF FQN  : {cfg.catalog.bronze_edf_fqn}")
+print(f"  Bronze Meta FQN : {cfg.catalog.bronze_metadata_fqn}")
+print()
+print("=== Storage Paths ===")
+print(f"  Volume EDF dir  : {cfg.paths.volume_edf_dir}")
+print(f"  AutoLoader ckpt : {cfg.paths.autoloader_checkpoint}")
 ```
 
-**What to observe:**
-- `cfg.catalog.catalog` = `"eeg_lakehouse"` (default, overridable via `DATABRICKS_ENV` env var)
-- `cfg.catalog.bronze_edf_fqn` = `"eeg_lakehouse.bronze.raw_eeg_files"`
-- `cfg.paths.volume_edf_dir` = `"/Volumes/eeg_lakehouse/bronze/raw_edf"` (UC Volume path)
-- `cfg.paths.autoloader_checkpoint` reads from `AUTOLOADER_CHECKPOINT` env var
+**Expected output:**
 
-**Why this matters for the exam:** `AppConfig` uses Python dataclasses with `field(default_factory=lambda: os.getenv(...))` — this is the production config management pattern. Unity Catalog FQNs follow the format `catalog.schema.table`.
+```
+=== Unity Catalog Configuration ===
+  Catalog         : eeg_lakehouse
+  Bronze EDF FQN  : eeg_lakehouse.bronze.raw_eeg_files
+  Bronze Meta FQN : eeg_lakehouse.bronze.subject_metadata
+
+=== Storage Paths ===
+  Volume EDF dir  : /Volumes/eeg_lakehouse/bronze/raw_edf
+  AutoLoader ckpt : /Volumes/eeg_lakehouse/bronze/checkpoints/autoloader
+```
+
+**Key concepts to understand:**
+
+- `AppConfig` uses Python `dataclasses` with `field(default_factory=lambda: os.getenv(...))` — this is the standard production configuration pattern that avoids hardcoded secrets and paths.
+- Unity Catalog FQNs follow the three-part format: `catalog.schema.table` (e.g., `eeg_lakehouse.bronze.raw_eeg_files`).
+- The catalog name is overridable via the `DATABRICKS_ENV` environment variable, which you set in Step E. This enables environment-specific isolation (`dev`, `staging`, `prod`).
 
 ---
 
-### Step 3 — Run Cell 2: Verify filename parsing logic
+### Step 2 — Run Cell 2: Verify EDF Filename Parsing Logic
+
+This cell exercises the three filename-parsing utility functions against a representative set of test filenames.
 
 ```python
 test_files = [
@@ -84,45 +218,57 @@ test_files = [
     "SC4002E0-PSG.edf",
 ]
 
-print(f"{'Filename':<30} {'subject_id':<12} {'night':<8} {'hypnogram'}")
-print("-" * 65)
-for f in test_files:
-    print(f"{f:<30} {str(extract_subject_id(f)):<12} "
-          f"{str(extract_study_night(f)):<8} {is_hypnogram_file(f)}")
+header = f"{'Filename':<30} {'subject_id':<14} {'night':<10} {'is_hypnogram'}"
+print(header)
+print("-" * len(header))
+
+for fname in test_files:
+    print(
+        f"{fname:<30} "
+        f"{str(extract_subject_id(fname)):<14} "
+        f"{str(extract_study_night(fname)):<10} "
+        f"{is_hypnogram_file(fname)}"
+    )
 ```
 
 **Expected output:**
+
 ```
-Filename                       subject_id   night    hypnogram
------------------------------------------------------------------
-SC4001E0-PSG.edf               SC4001       0        False
-SC4001EC-Hypnogram.edf         SC4001       None     True
-ST7011J0-PSG.edf               ST7011       0        False
-ST7011JC-Hypnogram.edf         ST7011       None     True
-SC4002E0-PSG.edf               SC4002       0        False
+Filename                       subject_id     night      is_hypnogram
+----------------------------------------------------------------------
+SC4001E0-PSG.edf               SC4001         0          False
+SC4001EC-Hypnogram.edf         SC4001         None       True
+ST7011J0-PSG.edf               ST7011         0          False
+ST7011JC-Hypnogram.edf         ST7011         None       True
+SC4002E0-PSG.edf               SC4002         0          False
 ```
 
-**How it works internally** (from `src/bronze/ingest_eeg_files.py`):
-- `_EDF_FILENAME_PATTERN` is a compiled regex matching the Sleep-EDF naming convention
-- `extract_subject_id()` returns `rec_type + age + subj_num` (e.g., `"SC4001"`)
-- `extract_study_night()` reads the last character of the night group (e.g., `"E0"` → `0`)
-- `is_hypnogram_file()` checks if `"Hypnogram"` appears in the filename
+**Implementation details** (from `src/bronze/ingest_eeg_files.py`):
 
-**Common pitfall:** Hypnogram files use `EC` as the night code (not `E0`/`E1`), so `extract_study_night` returns `None` for them — this is correct and expected.
+- `_EDF_FILENAME_PATTERN` is a pre-compiled regex that matches the Sleep-EDF naming convention. Compiling once at module load avoids repeated compilation during streaming ingestion.
+- `extract_subject_id()` concatenates the recording type, age group, and subject number segments (e.g., `SC` + `40` + `01` → `SC4001`).
+- `extract_study_night()` reads the trailing digit of the night code (`E0` → `0`, `E1` → `1`). Returns `None` for hypnogram files, which use `EC` as the night code.
+- `is_hypnogram_file()` checks for the literal substring `"Hypnogram"` in the filename.
+
+> **Common pitfall**: Hypnogram files use the night code `EC` rather than `E0` or `E1`. This causes `extract_study_night` to return `None` — this behaviour is intentional and correct. A null study night signals that no signal data is associated with this file.
 
 ---
 
-### Step 4 — Run Cell 3: Inspect the explicit Bronze schema
+### Step 3 — Run Cell 3: Inspect the Explicit Bronze Schema
+
+This cell creates an empty DataFrame from the pre-defined `BRONZE_EDF_SCHEMA` and prints the schema to verify the column names, types, and nullability constraints.
 
 ```python
 from pyspark.sql import SparkSession
+
 spark = SparkSession.builder.getOrCreate()
 
 empty_df = spark.createDataFrame([], BRONZE_EDF_SCHEMA)
 empty_df.printSchema()
 ```
 
-**Expected schema output:**
+**Expected output:**
+
 ```
 root
  |-- file_path: string (nullable = false)
@@ -138,105 +284,126 @@ root
  |-- dataset_source: string (nullable = false)
 ```
 
-**Key design decisions to understand for the exam:**
+**Schema design decisions:**
 
-| Decision | Reason |
-|---|---|
-| Explicit schema over `inferSchema` | Prevents type drift, avoids expensive scan on every restart |
-| `file_path` NOT NULL | Every record must have a traceable source path |
-| `subject_id` nullable | Regex may fail on unexpected filenames — fail gracefully |
-| `is_hypnogram` NOT NULL | Boolean classification must always be definitive |
-| `ingestion_timestamp` NOT NULL | Audit trail requirement — when was this file first seen |
-| `dataset_source` NOT NULL | Multi-dataset support — always tag the origin |
+| Column | Nullability | Rationale |
+|---|---|---|
+| `file_path` | NOT NULL | Every ingested record must have a traceable storage path |
+| `subject_id` | Nullable | Regex extraction may fail on unexpected filenames; null is a safe, informative fallback |
+| `is_hypnogram` | NOT NULL | This is a deterministic boolean derived from filename suffix — it must always be set |
+| `ingestion_timestamp` | NOT NULL | Audit trail requirement — the exact moment a file entered the pipeline must be recorded |
+| `dataset_source` | NOT NULL | Multi-dataset pipelines require an unambiguous origin tag on every record |
 
-**Exam note:** This is a Bronze table — it stores **raw metadata**, not processed signal data. The Bronze layer in Medallion Architecture should be append-only and schema-enforced but otherwise minimally transformed.
+> **Exam insight**: Always prefer explicit schemas over `inferSchema=True` in production Bronze pipelines. `inferSchema` requires a full data scan on every pipeline restart, introduces risk of type drift between runs, and cannot express nullability constraints.
 
 ---
 
-### Step 5 — Run Cell 4: Study Auto Loader configuration options
+### Step 4 — Run Cell 4: Study Auto Loader Configuration Options
 
-Review and understand each Auto Loader option used in `src/bronze/ingest_eeg_files.py`:
+This cell makes the Auto Loader options visible for inspection and discussion. These options are defined inside `load_raw_files()` in `src/bronze/ingest_eeg_files.py`.
 
 ```python
-# These options are set inside load_raw_files() in src/bronze/ingest_eeg_files.py
 auto_loader_options = {
-    "cloudFiles.format": "binaryFile",          # Read raw EDF bytes, not CSV/JSON
-    "cloudFiles.schemaLocation": cfg.paths.autoloader_schema_location,  # Persist schema between runs
-    "cloudFiles.useNotifications": "false",     # Directory listing mode (no cloud event setup needed)
-    "cloudFiles.includeExistingFiles": "true",  # Process pre-existing files on first run
-    "pathGlobFilter": "*.edf",                  # Only process EDF files
+    # EDF is a binary format; binaryFile mode yields path, length,
+    # modificationTime, and content columns without attempting to parse the binary body.
+    "cloudFiles.format": "binaryFile",
+
+    # Persists the inferred schema as JSON in a UC Volume path.
+    # On restart, schema is loaded from this location rather than re-inferred.
+    "cloudFiles.schemaLocation": cfg.paths.autoloader_schema_location,
+
+    # Directory listing mode: Databricks scans the Volume directory to detect new files.
+    # Set to "true" for event-based notification (Azure Event Grid / AWS S3 events) in production.
+    "cloudFiles.useNotifications": "false",
+
+    # Ensures files already present in the Volume before the first pipeline run
+    # are included in the initial ingestion batch.
+    "cloudFiles.includeExistingFiles": "true",
+
+    # Filters files by extension. Any non-.edf files in the same Volume directory are ignored.
+    "pathGlobFilter": "*.edf",
 }
 
-print("Auto Loader options:")
+print(f"{'Option':<45} {'Value'}")
+print("-" * 75)
 for k, v in auto_loader_options.items():
-    print(f"  {k}: {v}")
+    print(f"{k:<45} {v}")
 ```
 
-**Option-by-option explanation:**
+**Option reference:**
 
-| Option | Value | Why |
+| Option | Value | Why it matters |
 |---|---|---|
-| `cloudFiles.format` | `binaryFile` | EDF is a binary format — reading as binaryFile gives `path`, `length`, `modificationTime`, `content` columns |
-| `cloudFiles.schemaLocation` | UC Volume path | Stores inferred schema as JSON — avoids re-inference on restart |
-| `cloudFiles.useNotifications` | `false` | Uses directory listing — simpler, no cloud bucket notification setup |
-| `cloudFiles.includeExistingFiles` | `true` | Ensures the first run picks up all files already in the Volume |
-| `pathGlobFilter` | `*.edf` | Ignores any non-EDF files (e.g., `.txt` metadata files) in the same directory |
+| `cloudFiles.format` | `binaryFile` | EDF is binary — this mode reads files as raw bytes and exposes metadata columns (`path`, `length`, `modificationTime`) without attempting to parse the content |
+| `cloudFiles.schemaLocation` | UC Volume path | Stores the inferred schema as a JSON file between runs; prevents re-inference and enables schema evolution tracking |
+| `cloudFiles.useNotifications` | `false` | Uses directory listing (polling); simpler to configure than cloud bucket notifications, suitable for batch workloads |
+| `cloudFiles.includeExistingFiles` | `true` | Processes files that existed in the Volume before the pipeline first ran; set to `false` only when you want strict new-file-only semantics |
+| `pathGlobFilter` | `*.edf` | Restricts ingestion to EDF files; ignores auxiliary files (`.txt`, `.csv`, `.json`) that may share the same Volume directory |
 
-**Exam tip:** `schemaLocation` is the key that gives Auto Loader exactly-once semantics on restart. If the pipeline crashes mid-run, re-running reads from the checkpoint and does NOT re-process already-ingested files.
+> **Exam tip**: `cloudFiles.schemaLocation` is what gives Auto Loader its **exactly-once** restart semantics. If a streaming job crashes mid-run, re-starting it picks up from the Auto Loader checkpoint and does not re-process files that were already written to the Delta table.
 
 ---
 
-### Step 6 — Run Cell 5: (Optional) Trigger Bronze table creation
+### Step 5 — Run Cell 5 (Optional): Trigger Bronze Table Creation
 
-Only run this if you have a UC-enabled cluster with EDF files in the Volume:
+Run this cell only if a UC-enabled cluster is active **and** EDF files are already uploaded to the Volume at `/Volumes/eeg_lakehouse/bronze/raw_edf/`.
+
+If you have not yet uploaded EDF files, skip this cell and return to it during Day 3.
 
 ```python
 from src.bronze.ingest_eeg_files import create_bronze_table
 
-# trigger_once=True uses .trigger(availableNow=True) — processes all pending files then stops
+# trigger(availableNow=True) processes all pending files in a single micro-batch, then stops.
+# This is preferred over trigger(once=True), which is deprecated as of Spark 3.3.
 create_bronze_table(spark, cfg, trigger_once=True)
 ```
 
-**If you do NOT yet have EDF files uploaded**, skip this cell and come back to it during Day 3 after uploading files to the Volume.
-
 **What `create_bronze_table()` does internally:**
-1. Calls `load_raw_files()` which sets up `spark.readStream.format("cloudFiles")` with the options above
-2. Registers `_extract_subject_id_udf` and `_extract_study_night_udf` as Spark UDFs
-3. Adds `ingestion_timestamp = F.current_timestamp()` and `dataset_source = "physionet-sleep-edf"`
-4. Writes stream to `eeg_lakehouse.bronze.raw_eeg_files` via `.trigger(availableNow=True).toTable()`
-5. Calls `query.awaitTermination()` to block until all files are processed
+
+1. Calls `load_raw_files()`, which initialises `spark.readStream.format("cloudFiles")` with the options documented in Step 4.
+2. Registers `_extract_subject_id_udf` and `_extract_study_night_udf` as Spark UDFs (applied per row during streaming ingestion).
+3. Appends `ingestion_timestamp = F.current_timestamp()` and `dataset_source = "physionet-sleep-edf"` as literal columns.
+4. Writes the stream to `eeg_lakehouse.bronze.raw_eeg_files` using `.trigger(availableNow=True).toTable()`.
+5. Calls `query.awaitTermination()` to block the driver process until the micro-batch completes.
+
+After the cell completes, verify the table was created:
+
+```python
+display(spark.table("eeg_lakehouse.bronze.raw_eeg_files").limit(10))
+```
 
 ---
 
-### Step 7 — Self-check: Answer exam reflection questions
+### Step 6 — Self-Check: Exam Reflection Questions
 
-Before ending Day 2, answer these without looking at the code:
+Answer the following questions without referring to the source code. These map directly to exam question patterns.
 
 1. Why does Auto Loader use `binaryFile` format for EDF files instead of `csv` or `parquet`?
-2. What happens if you delete the `schemaLocation` directory and re-run ingestion?
-3. Why is the Bronze table a metadata registry and not a table of raw EEG signal values?
-4. What does `cloudFiles.includeExistingFiles = true` do — and what would happen without it?
-5. Why is `subject_id` nullable in the Bronze schema but `is_hypnogram` is NOT NULL?
-6. What is the Unity Catalog FQN for the Bronze EDF table in this project?
+2. What happens if you delete the `schemaLocation` directory and then re-run the ingestion pipeline?
+3. Why does the Bronze layer in this project store only file metadata, not raw EEG signal values?
+4. What does `cloudFiles.includeExistingFiles = true` do, and what would happen if it were set to `false` on the very first run?
+5. Why is `subject_id` nullable in the Bronze schema but `is_hypnogram` is defined as NOT NULL?
+6. What is the fully-qualified Unity Catalog name for the Bronze EDF table in this project?
 
 **Answers:**
-1. EDF is binary — Auto Loader's `binaryFile` format reads it as raw bytes with metadata columns; `csv`/`parquet` would fail to parse the EDF binary structure
-2. Auto Loader loses track of already-processed files and re-ingests everything, creating duplicates
-3. EDF parsing requires MNE-Python (Python-only) — Bronze stores metadata only; actual signal parsing happens in Silver via `mapInPandas`
-4. First run would skip files already in the Volume before the pipeline was started
-5. `subject_id` is extracted via regex and may fail on unexpected filenames (null = safe fallback); `is_hypnogram` is a boolean derived from filename suffix — always deterministic
+
+1. EDF is a binary format — `binaryFile` mode reads it as raw bytes with metadata columns (`path`, `length`, `modificationTime`, `content`). Using `csv` or `parquet` would cause a parse failure.
+2. Auto Loader loses all tracking state. On restart it re-scans the entire directory and re-ingests all files, creating duplicate rows in the Bronze table.
+3. EDF signal parsing requires MNE-Python, which is Python-only and cannot run natively in a JVM Spark executor. Signal decoding is deferred to the Silver layer where `mapInPandas` (Pandas UDF) enables Python-based processing at scale.
+4. `includeExistingFiles = true` ensures the first pipeline run ingests all files already present in the Volume. With `false`, only files arriving **after** the pipeline started would be processed — all pre-existing files would be silently skipped.
+5. `subject_id` is extracted via regex and may be null if a filename does not match the expected pattern (safe, informative fallback). `is_hypnogram` is a deterministic boolean check on a filename suffix — it is always either `True` or `False` and therefore must never be null.
 6. `eeg_lakehouse.bronze.raw_eeg_files`
 
 ---
 
-## Day 2 Summary
+## Day 2 Build Summary
 
-| What was built | Source |
+| Artefact | Source File |
 |---|---|
 | AppConfig exploration and FQN verification | `src/utils/config.py` |
-| EDF filename parsing validation (5 test files) | `src/bronze/ingest_eeg_files.py` |
+| EDF filename parsing validation (5 test filenames) | `src/bronze/ingest_eeg_files.py` |
 | Explicit Bronze schema review (`BRONZE_EDF_SCHEMA`) | `src/bronze/ingest_eeg_files.py` |
-| Auto Loader options reference table | `src/bronze/ingest_eeg_files.py` |
-| Optional: Bronze table creation with Auto Loader | `notebooks/day02_bronze_schema_design.py` |
+| Auto Loader options reference and documentation | `src/bronze/ingest_eeg_files.py` |
+| Optional: Bronze table creation via Auto Loader | `notebooks/day02_bronze_schema_design.py` |
 
-**Next**: Day 3 runs the actual Bronze ingestion with Auto Loader, inspects Delta transaction history, and runs data quality assertions.
+**Next**: Day 3 executes the full Auto Loader Bronze ingestion run, inspects the Delta transaction log, and validates data quality with Great Expectations assertions.
