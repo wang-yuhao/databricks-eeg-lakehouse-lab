@@ -163,12 +163,14 @@ az storage account create \
 STORAGE_ACCOUNT="steeglakehouse"
 RESOURCE_GROUP="rg-eeg-lakehouse-prod"
 
+# Note: az storage fs create does NOT accept --resource-group;
+# the storage account name alone is sufficient to identify the target.
 for container in bronze silver gold checkpoints unity-catalog; do
   az storage fs create \
     --name $container \
     --account-name $STORAGE_ACCOUNT \
-    --resource-group $RESOURCE_GROUP \
     --auth-mode login
+  echo "Created container: $container"
 done
 ```
 
@@ -428,80 +430,232 @@ databricks secrets create-scope \
 
 ## Step 6: Set Up Unity Catalog
 
-Unity Catalog is **enabled by default** on new Premium workspaces in 2026. This section covers creating the metastore, external location, and catalog structure.
+> **Why you can't find "metastore" in the UI:** Since November 2023, all new Premium workspaces automatically get a metastore created and attached. When that happens, the metastore is invisible as a separate object — it just works silently in the background and the "Create metastore" button disappears. If you cannot find it, that is probably a good sign. Follow the diagnosis flow below to confirm your situation before doing anything.
 
-### 6.1 Access the Databricks Account Console
+### 6.0 Diagnose Your Unity Catalog Status (Start Here)
 
-Navigate to <https://accounts.azuredatabricks.net> → sign in as account admin.
+Work through these checks in order and stop as soon as one matches.
 
-### 6.2 Create Metastore (One-Time, Per Region)
+**Check A — Is Unity Catalog already working?**
 
-> If a metastore already exists for your region, skip to 6.4 (assign workspace).
+1. Open your Databricks workspace.
+2. In the left sidebar, click the **Catalog** icon (stacked-layers icon, near the bottom of the sidebar).
+3. If you see catalogs listed — especially one named after your workspace, or named `main` — **Unity Catalog is already fully active. Skip everything in 6.1–6.3 and go directly to 6.4.**
 
-1. In Account Console → **"Data"** → **"Unity Catalog"** → **"Create metastore"**.
-2. Fill in:
-   - **Metastore name**: `eeg-lakehouse-metastore-germanywestcentral`
-   - **Region**: `germanywestcentral`
-   - **ADLS Gen2 path**: `abfss://unity-catalog@steeglakehouse.dfs.core.windows.net/`
-   - **Access connector ID**: paste the Resource ID of `ac-eeg-lakehouse`
-3. Click **"Create"**.
+**Check B — Is there a metastore in the Account Console but not attached?**
 
-### 6.3 Assign Metastore to Workspace
+1. Go to the Account Console: click your **username** (top-right of workspace) → **"Manage Account"**. Or navigate directly to <https://accounts.azuredatabricks.net>.
+2. In the left sidebar of the Account Console, click **Catalog**.
+3. If you see a metastore listed → it exists but may not be attached to your workspace. Go to **6.3** (assign workspace).
+4. If the Catalog section is empty with a **"Create metastore"** button → no metastore exists yet. Go to **6.2**.
+5. If you cannot access the Account Console at all, or do not see **"Manage Account"** in your username dropdown → you are not an account admin. Go to **6.1** to fix that first.
 
-1. Select the metastore → **"Workspaces"** tab.
-2. Click **"Assign to workspace"**.
-3. Select `dbw-eeg-lakehouse-prod` → **"Assign"**.
+**Check C — Confirm via SQL (quickest)**
 
-### 6.4 Create External Location for ADLS Gen2
-
-In the Databricks workspace (not account console), open a SQL notebook:
+Open any notebook and run:
 
 ```sql
--- Create storage credential backed by the Access Connector
-CREATE STORAGE CREDENTIAL `eeg-lakehouse-credential`
-WITH AZURE_MANAGED_IDENTITY (
-  CONNECTOR = '/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/rg-eeg-lakehouse-prod/providers/Microsoft.Databricks/accessConnectors/ac-eeg-lakehouse'
-);
+SELECT current_metastore();
+```
 
--- Create external locations for each layer
-CREATE EXTERNAL LOCATION `bronze-location`
+If this returns a metastore ID (a UUID), Unity Catalog is active and your workspace is attached — skip to 6.4. If it errors, your workspace is not attached to a metastore — continue with 6.1 or 6.2.
+
+---
+
+### 6.1 Become an Account Admin (Only If You Can't Access the Account Console)
+
+> Skip if "Manage Account" is visible in your username dropdown.
+
+The first account admin for an Azure Databricks account must be a Microsoft Entra ID Global Administrator who logs in to the Account Console for the first time.
+
+1. Make sure you are signed into the Azure Portal as a **Global Administrator** (check under Microsoft Entra ID → Roles and administrators).
+2. Navigate to <https://accounts.azuredatabricks.net> and sign in with the same Microsoft Entra ID credentials.
+3. On first login as Global Admin, Databricks automatically assigns you the account admin role.
+4. You can now assign additional account admins: Account Console → **User management** → find your user → **"Make account admin"**.
+
+> **If you created the workspace via Azure Portal but cannot access the Account Console:** This is the most common issue. Creating a workspace in Azure does not automatically make you an account admin. You must log in to `accounts.azuredatabricks.net` as a Global Admin at least once to bootstrap the account.
+
+---
+
+### 6.2 Create Metastore (Only If Check B Found None)
+
+> Skip if Check A or Check B found an existing metastore.
+
+In the Account Console, the metastore lives under **Catalog** — there is no "Data → Unity Catalog" menu. That navigation path no longer exists.
+
+1. In the Account Console left sidebar, click **Catalog**.
+2. Click **"Create metastore"** (top-right).
+3. Fill in:
+   - **Name**: `eeg-lakehouse-metastore-germanywestcentral`
+   - **Region**: `germanywestcentral`
+   - **ADLS Gen 2 path** *(optional — leave blank if you want Databricks to manage storage automatically)*:
+     `unity-catalog@steeglakehouse.dfs.core.windows.net/eeg-lakehouse-metastore-germanywestcentral`
+     > The UI prepends `abfss://` automatically. Do not include it yourself.
+   - **Access Connector ID** *(only required if you filled in the path above)*:
+     ```
+     /subscriptions/<SUBSCRIPTION_ID>/resourceGroups/rg-eeg-lakehouse-prod/providers/Microsoft.Databricks/accessConnectors/ac-eeg-lakehouse
+     ```
+     Get your subscription ID in Cloud Shell: `az account show --query id -o tsv`
+4. Click **"Create"**.
+5. When prompted immediately after, select `dbw-eeg-lakehouse-prod` → **"Assign"** to attach the workspace now.
+
+> **One metastore per region:** You can have only one metastore per Azure region. If the button says "Create metastore" but immediately fails saying one already exists, someone else in your account already created one — go to 6.3 instead.
+
+> **Auto-created metastores have no root storage by default.** That is fine — storage is managed at the catalog and schema level for this project (configured in 6.5 and 6.6).
+
+---
+
+### 6.3 Attach Workspace to Existing Metastore (Only If Metastore Exists But Workspace Is Not Attached)
+
+> Only needed if Check B found a metastore in the Account Console but `SELECT current_metastore()` still errors in your workspace.
+
+1. Account Console → **Catalog** → click the metastore name.
+2. Click the **"Workspaces"** tab.
+3. Click **"Assign to workspace"**.
+4. Select `dbw-eeg-lakehouse-prod` → click **"Assign"**.
+5. Go back to your workspace, open a notebook, and re-run `SELECT current_metastore();` to confirm it now returns a UUID.
+
+### 6.4 Enable CORS on Storage Account (Required for Managed Volume Uploads)
+
+Databricks uses CORS to upload data to managed volumes. Without this, volume operations will silently fail.
+
+1. In the Azure Portal, open storage account `steeglakehouse`.
+2. Left sidebar → **Settings** → **Resource sharing (CORS)**.
+3. Make sure the **Blob service** tab is selected.
+4. Add a new row:
+
+   | Field           | Value                           |
+   | --------------- | ------------------------------- |
+   | Allowed origins | `https://*.azuredatabricks.net` |
+   | Allowed methods | `PUT`                           |
+   | Allowed headers | `x-ms-blob-type`                |
+   | Exposed headers | *(leave blank)*                 |
+   | Max age         | `1800`                          |
+
+5. Click **"Save"**.
+
+### 6.5 Create Storage Credential and External Locations
+
+> **⚠️ PARSE_SYNTAX_ERROR on `CREATE STORAGE CREDENTIAL`?** This means you are running the SQL in a classic notebook attached to a cluster, not in a **SQL Warehouse**. The `CREATE STORAGE CREDENTIAL` command is only recognized by a SQL Warehouse context. Either use the **Catalog Explorer UI below (recommended)**, or switch to a SQL Warehouse as described.
+
+#### Option A — Catalog Explorer UI (Recommended, No SQL Required)
+
+This is the easiest path and avoids the syntax error entirely.
+
+**Create the storage credential:**
+1. In the workspace sidebar, click **Catalog**.
+2. Click **Connect** (or the plug icon at the top of the Catalog pane) → **Credentials**.
+3. Click **"Create credential"** → select **"Storage credential"**.
+4. Fill in:
+   - **Credential name**: `eeg-lakehouse-credential`
+   - **Credential type**: `Azure Managed Identity`
+   - **Access connector ID**:
+     ```
+     /subscriptions/f7a30b08-37de-4dcc-8a1e-f097c8a332ca/resourceGroups/rg-eeg-lakehouse-prod/providers/Microsoft.Databricks/accessConnectors/ac-eeg-lakehouse
+     ```
+5. Click **"Create"**.
+
+**Create all five external locations** (the `unity-catalog` container must be included — it is required for `CREATE CATALOG` in Step 6.6):
+
+1. Still in **Catalog** → **Connect** → click **"External Locations"** tab.
+2. Click **"Create location"** → **"Manual"** and add each row below. For each: select `eeg-lakehouse-credential` as the storage credential, then click **"Create"** and **"Test connection"**.
+
+   | Location name            | URL                                                              | Purpose                         |
+   | ------------------------ | ---------------------------------------------------------------- | ------------------------------- |
+   | `unity-catalog-location` | `abfss://unity-catalog@steeglakehouse.dfs.core.windows.net/`    | Catalog managed storage ⚠️ Required for Step 6.6 |
+   | `bronze-location`        | `abfss://bronze@steeglakehouse.dfs.core.windows.net/`           | Raw EEG data                    |
+   | `silver-location`        | `abfss://silver@steeglakehouse.dfs.core.windows.net/`           | Validated data                  |
+   | `gold-location`          | `abfss://gold@steeglakehouse.dfs.core.windows.net/`             | Feature tables                  |
+   | `checkpoints-location`   | `abfss://checkpoints@steeglakehouse.dfs.core.windows.net/`      | DLT pipeline state              |
+
+   > **⚠️ Don't skip `unity-catalog-location`.** Without it, `CREATE CATALOG ... MANAGED LOCATION 'abfss://unity-catalog@...'` in Step 6.6 fails with `EXTERNAL_LOCATION_DOES_NOT_EXIST`. Databricks requires an external location to exist that covers every `MANAGED LOCATION` path before it can be used.
+
+---
+
+#### Option B — SQL Warehouse (If You Prefer SQL)
+
+`CREATE STORAGE CREDENTIAL` only works from a **SQL Warehouse**, not from a notebook attached to a classic cluster or serverless.
+
+**First, create a SQL Warehouse if you don't have one:**
+Sidebar → **SQL Warehouses** → **"+ Create"** → Serverless → Start.
+
+**Then open the SQL Editor** (sidebar → **SQL Editor**) and run:
+
+Get your subscription ID first in Cloud Shell: `az account show --query id -o tsv`
+
+```sql
+-- Run in SQL Editor (SQL Warehouse), NOT in a notebook
+-- Correct syntax for Azure Managed Identity storage credential:
+CREATE STORAGE CREDENTIAL IF NOT EXISTS `eeg-lakehouse-credential`
+WITH IDENTITY = 'ManagedIdentity'
+ON '/subscriptions/f7a30b08-37de-4dcc-8a1e-f097c8a332ca/resourceGroups/rg-eeg-lakehouse-prod/providers/Microsoft.Databricks/accessConnectors/ac-eeg-lakehouse';
+
+-- Validate
+SHOW STORAGE CREDENTIALS;
+```
+
+Then create the external locations:
+
+```sql
+-- Run in SQL Editor (SQL Warehouse)
+-- unity-catalog-location is REQUIRED for CREATE CATALOG in Step 6.6
+CREATE EXTERNAL LOCATION IF NOT EXISTS `unity-catalog-location`
+URL 'abfss://unity-catalog@steeglakehouse.dfs.core.windows.net/'
+WITH (STORAGE CREDENTIAL `eeg-lakehouse-credential`);
+
+CREATE EXTERNAL LOCATION IF NOT EXISTS `bronze-location`
 URL 'abfss://bronze@steeglakehouse.dfs.core.windows.net/'
 WITH (STORAGE CREDENTIAL `eeg-lakehouse-credential`);
 
-CREATE EXTERNAL LOCATION `silver-location`
+CREATE EXTERNAL LOCATION IF NOT EXISTS `silver-location`
 URL 'abfss://silver@steeglakehouse.dfs.core.windows.net/'
 WITH (STORAGE CREDENTIAL `eeg-lakehouse-credential`);
 
-CREATE EXTERNAL LOCATION `gold-location`
+CREATE EXTERNAL LOCATION IF NOT EXISTS `gold-location`
 URL 'abfss://gold@steeglakehouse.dfs.core.windows.net/'
 WITH (STORAGE CREDENTIAL `eeg-lakehouse-credential`);
 
-CREATE EXTERNAL LOCATION `checkpoints-location`
+CREATE EXTERNAL LOCATION IF NOT EXISTS `checkpoints-location`
 URL 'abfss://checkpoints@steeglakehouse.dfs.core.windows.net/'
 WITH (STORAGE CREDENTIAL `eeg-lakehouse-credential`);
 
--- Validate
+-- Validate all five are listed and show "Available"
 SHOW EXTERNAL LOCATIONS;
 ```
 
-### 6.5 Create Catalog and Schemas
+> **Why not a notebook?** Classic cluster notebooks use Spark SQL, which does not include Unity Catalog DDL commands like `CREATE STORAGE CREDENTIAL`. Serverless notebooks also do not support these DDL statements. Only the SQL Warehouse engine (or the Catalog Explorer UI) handles Unity Catalog metadata DDL.
+
+### 6.6 Create Catalog and Schemas
+
+> **Why `EXTERNAL_LOCATION_DOES_NOT_EXIST`?** Before you can use `MANAGED LOCATION 'abfss://unity-catalog@...'`, an external location covering that container must exist in Unity Catalog. Go back to Step 6.5 and create `unity-catalog-location` first, then return here.
+
+> **Why `INVALID_STATE` (Metastore storage root URL does not exist)?** Auto-provisioned metastores have no root storage path — `CREATE CATALOG` without `MANAGED LOCATION` has nowhere to write. Always supply `MANAGED LOCATION` explicitly, as every statement below does.
+
+#### Option A — SQL Editor (SQL Warehouse)
+
+Run in the **SQL Editor** (not a notebook) with a SQL Warehouse attached:
 
 ```sql
--- Create project catalog
+-- Catalog needs its own managed storage location in the unity-catalog container
+-- Run each statement individually and wait for it to complete before the next
+
 CREATE CATALOG IF NOT EXISTS eeg_lakehouse
+MANAGED LOCATION 'abfss://unity-catalog@steeglakehouse.dfs.core.windows.net/catalogs/eeg_lakehouse'
 COMMENT 'EEG Lakehouse Lab — Medallion Architecture for EEG signal processing';
 
 USE CATALOG eeg_lakehouse;
 
--- Create Medallion schemas backed by external locations
+-- Bronze schema — raw EEG layer
 CREATE SCHEMA IF NOT EXISTS bronze
 MANAGED LOCATION 'abfss://bronze@steeglakehouse.dfs.core.windows.net/managed'
 COMMENT 'Raw EEG data layer: .edf files, WFDB records, metadata JSON';
 
+-- Silver schema — cleaned and validated layer
 CREATE SCHEMA IF NOT EXISTS silver
 MANAGED LOCATION 'abfss://silver@steeglakehouse.dfs.core.windows.net/managed'
 COMMENT 'Cleaned and validated layer: segmented EEG epochs, quality-filtered signals';
 
+-- Gold schema — feature-aggregated layer
 CREATE SCHEMA IF NOT EXISTS gold
 MANAGED LOCATION 'abfss://gold@steeglakehouse.dfs.core.windows.net/managed'
 COMMENT 'Feature-aggregated layer: band power, connectivity metrics, ML-ready features';
@@ -511,7 +665,28 @@ SHOW CATALOGS;
 SHOW SCHEMAS IN eeg_lakehouse;
 ```
 
-**Expected result**: Catalog `eeg_lakehouse` with three schemas visible in the Databricks catalog explorer.
+> **Prerequisites for `MANAGED LOCATION` to work:**
+> - The `unity-catalog` container must exist in `steeglakehouse` (created in Step 2.2)
+> - The external location `checkpoints-location` or a location covering `abfss://unity-catalog@steeglakehouse...` must exist (created in Step 6.5), OR the storage credential `eeg-lakehouse-credential` must have access
+> - If you get `LOCATION_ALREADY_COVERED_BY_EXISTING_EXTERNAL_LOCATION`, the path overlaps an existing external location — change the subpath, e.g. `.../catalogs/eeg_lakehouse_v2`
+
+#### Option B — Catalog Explorer UI (Avoids All SQL Errors)
+
+If SQL keeps failing, create the catalog through the UI instead:
+
+1. Workspace sidebar → **Catalog**.
+2. Click **"+"** (Add) at the top of the Catalog pane → **"Add a catalog"**.
+3. Fill in:
+   - **Catalog name**: `eeg_lakehouse`
+   - **Storage location**: select `eeg-lakehouse-credential` and enter path:
+     `abfss://unity-catalog@steeglakehouse.dfs.core.windows.net/catalogs/eeg_lakehouse`
+   - **Comment**: `EEG Lakehouse Lab — Medallion Architecture for EEG signal processing`
+4. Click **"Create"**.
+5. Then inside the catalog, click **"+"** → **"Add a schema"** for each of `bronze`, `silver`, `gold`, providing the matching `abfss://` managed location path for each.
+
+**Expected result**: Catalog `eeg_lakehouse` with three schemas (`bronze`, `silver`, `gold`) visible in the Catalog Explorer sidebar.
+
+> **Tip:** Run `SHOW SCHEMAS IN eeg_lakehouse;` in the SQL Editor anytime to confirm all three schemas exist.
 
 ---
 
