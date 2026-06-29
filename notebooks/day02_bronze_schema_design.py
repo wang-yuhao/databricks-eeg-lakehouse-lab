@@ -1,4 +1,11 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "1"
+# dependencies = [
+#   "loguru",
+# ]
+# ///
 # MAGIC %md
 # MAGIC # Day 2: Dataset Interface & Bronze Schema Design
 # MAGIC
@@ -11,11 +18,18 @@
 # MAGIC **Exam domains:** Auto Loader (Domain 3), Delta schema enforcement (Domain 1)
 
 # COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## 1. Explore Config
 
 # COMMAND ----------
 
+# DBTITLE 1,Install dependencies
+# MAGIC %pip install loguru
+
+# COMMAND ----------
+
+# DBTITLE 1,Cell 3
 import sys, os
 sys.path.insert(0, os.path.join(os.getcwd(), ".."))
 
@@ -33,6 +47,7 @@ print("Bronze EDF FQN:", cfg.catalog.bronze_edf_fqn)
 print("Bronze Metadata FQN:", cfg.catalog.bronze_metadata_fqn)
 
 # COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## 2. Verify filename parsing logic
 
@@ -55,6 +70,7 @@ for f in test_files:
     print(f"{f:<30} {str(sid):<12} {str(night):<8} {hyp}")
 
 # COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## 3. Inspect Bronze Delta schema
 
@@ -63,12 +79,13 @@ for f in test_files:
 from pyspark.sql.types import StructType
 import json
 
-print("Bronze EDF Schema:")
+print("Bronze EDF test Schema:")
 for field in BRONZE_EDF_SCHEMA.fields:
     nullable = "nullable" if field.nullable else "NOT NULL"
     print(f"  {field.name:<35} {str(field.dataType):<20} {nullable}")
 
 # COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## 4. Auto Loader options reference
 # MAGIC
@@ -86,6 +103,7 @@ for field in BRONZE_EDF_SCHEMA.fields:
 # MAGIC - **Exam pitfall**: COPY INTO does NOT use cloudFiles format; Auto Loader does.
 
 # COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## 5. (Optional) Create Bronze tables on Databricks
 # MAGIC
@@ -111,3 +129,7 @@ for field in BRONZE_EDF_SCHEMA.fields:
 # spark.sql(f"SELECT * FROM {cfg.catalog.bronze_edf_fqn} LIMIT 10").show(truncate=False)
 
 print("Day 2 complete. Tomorrow: Auto Loader full run + Bronze tests.")
+
+# COMMAND ----------
+
+
