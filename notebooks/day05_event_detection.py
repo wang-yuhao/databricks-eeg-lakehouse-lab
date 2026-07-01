@@ -24,9 +24,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import *
 
 cfg = AppConfig()
-SILVER_PATH = "dbfs:/eeg_lakehouse/silver/cleaned_epochs"
-SILVER_TABLE = "eeg_lakehouse.silver.cleaned_epochs"
-print(f"Silver path : {SILVER_PATH}")
+SILVER_TABLE = cfg.catalog.silver_epochs_fqn
 print(f"Silver table: {SILVER_TABLE}")
 
 # COMMAND ----------
