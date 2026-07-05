@@ -1,15 +1,13 @@
 # Day 5: Delta Lake Internals — Time Travel, OPTIMIZE, ZORDER, VACUUM
 
-**Notebook**: `notebooks/day05_delta_internals.py`
-**Exam domains**: Delta Lake (Domain 2 — Delta with Spark SQL & Python)
-**Time estimate**: 2–3 hours
+**Time estimate**: 2–3 hours  
 **Prerequisite**: Day 4 completed; Silver table `eeg_lakehouse.silver.cleaned_epochs` exists
 
 ---
 
 ## Environment Setup
 
-Complete every sub-section below before executing any notebook cell. A reader starting from a blank Databricks workspace must follow these steps in order.
+Complete every sub-section below before executing any notebook cell. A reader starting from a blank Databricks workspace must follow these steps in order. The lab assumes the Silver dataset already exists as the Unity Catalog table `eeg_lakehouse.silver.cleaned_epochs`; it does **not** assume a manually created folder such as `SILVER_PATH` exists. [page:1][web:8]
 
 ### 1. Create a GitHub Personal Access Token (PAT)
 
@@ -54,7 +52,7 @@ Complete every sub-section below before executing any notebook cell. A reader st
 
 4. Expand **Advanced options** > **Spark** and add the following configuration:
 
-```
+```text
 spark.databricks.delta.retentionDurationCheck.enabled false
 spark.sql.extensions io.delta.sql.DeltaSparkSessionExtension
 spark.sql.catalog.spark_catalog org.apache.spark.sql.delta.catalog.DeltaCatalog
@@ -79,7 +77,7 @@ spark.sql.catalog.spark_catalog org.apache.spark.sql.delta.catalog.DeltaCatalog
 ### 6. Open and Attach the Notebook
 
 1. In the left sidebar, click **Repos** and navigate to `wang-yuhao/databricks-eeg-lakehouse-lab/notebooks/`.
-2. Click `day05_delta_internals.py` to open it.
+2. Open the Day 5 Delta Lake notebook for this lab. If the filename in the repo differs from this document, use the notebook whose content covers time travel, OPTIMIZE, ZORDER, and VACUUM.
 3. In the notebook toolbar, click the cluster dropdown and select `eeg-lab-cluster`.
 4. Confirm the cluster indicator turns green before running any cell.
 
@@ -87,299 +85,303 @@ spark.sql.catalog.spark_catalog org.apache.spark.sql.delta.catalog.DeltaCatalog
 
 ## Objectives
 
-- Understand the structure of the Delta Lake transaction log (`_delta_log`).
+- Understand how Delta Lake tracks table versions through the transaction log.
 - Perform time travel queries by version number and by timestamp.
 - Use `OPTIMIZE` to compact small Parquet files.
 - Apply `ZORDER` for column-level data co-location.
 - Execute `VACUUM` to remove obsolete file versions.
-- Inspect and interpret the full Delta table commit history.
+- Inspect and interpret Delta table commit history.
 
 ---
 
 ## Background
 
-Delta Lake stores data as a set of Parquet files alongside a JSON-based transaction log. Every write, update, or schema change appends a new entry to this log. The runtime reconstructs the table state for any historical version by replaying the log from version 0.
+Delta Lake stores table data in Parquet files and tracks changes through a transaction log that records file additions, removals, and metadata operations. The engine can reconstruct the state of a table at an earlier version by replaying the log, which is why time travel works. [web:11]
 
-| Concept | Description | Exam relevance |
-|---|---|---|
-| `_delta_log/` | JSON commit log; one file per transaction | Time travel; audit trail |
-| Time travel by version | `option("versionAsOf", N)` | Rollback; A/B testing |
-| Time travel by timestamp | `option("timestampAsOf", "YYYY-MM-DD HH:MM:SS")` | Point-in-time recovery |
-| `OPTIMIZE` | Merges small files into ~1 GB target files | Reduces read overhead |
-| `ZORDER BY` | Co-locates rows sharing the same column values | Accelerates predicate filters |
-| `VACUUM` | Deletes Parquet files older than the retention threshold | Reduces storage cost |
+In this lab, you should treat the Unity Catalog table name as the source of truth:
 
-> **Exam tip**: `OPTIMIZE` does **not** delete old files. You must run `VACUUM` after `OPTIMIZE` to reclaim storage. `ZORDER` is effective only on high-cardinality columns such as `subject_id`; applying it to low-cardinality columns such as `is_artifact` provides no benefit.
+```python
+SILVER_TABLE = "eeg_lakehouse.silver.cleaned_epochs"
+```
+
+Use the catalog table directly throughout the notebook. Do **not** assume a `SILVER_PATH` constant exists or that previous project days created a manually named folder. [page:1][web:8]
 
 ---
 
-## Step-by-Step Instructions
+## Step 1 — Define the Delta table handle
 
-### Step 1 — Define the Silver table path
-
-Run the following cell to establish the storage path used throughout this notebook.
+Create the canonical table reference and a Delta Lake handle:
 
 ```python
 from delta.tables import DeltaTable
-from pyspark.sql import functions as F
-import json, datetime
 
-SILVER_PATH = "dbfs:/eeg_lakehouse/silver/cleaned_epochs"
 SILVER_TABLE = "eeg_lakehouse.silver.cleaned_epochs"
-
-print(f"Silver path : {SILVER_PATH}")
-print(f"Silver table: {SILVER_TABLE}")
+delta_table = DeltaTable.forName(spark, SILVER_TABLE)
 ```
 
-**Expected output**:
-
-```
-Silver path : dbfs:/eeg_lakehouse/silver/cleaned_epochs
-Silver table: eeg_lakehouse.silver.cleaned_epochs
-```
+`DeltaTable.forName()` binds directly to the registered Unity Catalog table, which is a better fit for this project than a hard-coded storage path. [web:11]
 
 ---
 
-### Step 2 — List the storage root
+## Step 2 — Inspect table metadata with DESCRIBE DETAIL
 
-```python
-display(dbutils.fs.ls(SILVER_PATH))
+Retrieve the current table metadata:
+
+```sql
+DESCRIBE DETAIL eeg_lakehouse.silver.cleaned_epochs;
 ```
 
-**Expected output** (columns: `path`, `name`, `size`):
+Review the following fields carefully:
 
-```
-dbfs:/eeg_lakehouse/silver/cleaned_epochs/_delta_log/   _delta_log/   0
-dbfs:/eeg_lakehouse/silver/cleaned_epochs/subject_id=001/   subject_id=001/   0
-dbfs:/eeg_lakehouse/silver/cleaned_epochs/subject_id=002/   subject_id=002/   0
-```
+- `format`
+- `location`
+- `numFiles`
+- `sizeInBytes`
+- `partitionColumns`
 
-The `_delta_log/` directory is the transaction log. Partition directories (`subject_id=001/`, etc.) contain the actual Parquet data files.
+`DESCRIBE DETAIL` is the supported Databricks command for inspecting table metadata such as location, file count, and total size. [web:8]
+
+### Why this replaces `dbutils.fs.ls(SILVER_PATH)`
+
+Earlier versions of this lab listed files directly from a storage path. That approach breaks when the table exists in Unity Catalog but no explicit project-level path constant was created. `DESCRIBE DETAIL` is more robust because it works from the table definition itself. [page:1][web:8]
 
 ---
 
-### Step 3 — Inspect the transaction log
+## Step 3 — Inspect commit history with DESCRIBE HISTORY
 
-```python
-display(dbutils.fs.ls(f"{SILVER_PATH}/_delta_log/"))
+Display the full commit history of the Silver table:
+
+```sql
+DESCRIBE HISTORY eeg_lakehouse.silver.cleaned_epochs;
 ```
 
-**Expected output**:
+This shows version numbers, timestamps, operations, users, and operation parameters for each commit. Delta Lake also exposes history programmatically through `DeltaTable.history()`. [web:11]
 
-```
-dbfs:/eeg_lakehouse/silver/cleaned_epochs/_delta_log/00000000000000000000.json
-dbfs:/eeg_lakehouse/silver/cleaned_epochs/_delta_log/00000000000000000001.json
-```
+### Why this replaces raw `_delta_log` file reads
 
-Each `.json` file corresponds to one committed transaction. File `00000000000000000000.json` is the initial table creation (version 0).
+Path-based `_delta_log` exploration is useful for internals study, but it should not be the primary teaching path in a Unity Catalog lab. `DESCRIBE HISTORY` gives a stable, portable view of the same versioned behavior without depending on a manually known storage root. [web:11][web:8]
 
 ---
 
-### Step 4 — Read a raw commit entry
+## Step 4 — Discover the physical storage location
+
+Even though this lab is table-first, it is still helpful to see that the table has a physical backing location. Save the `location` value returned by `DESCRIBE DETAIL`.
+
+Example pattern:
 
 ```python
-log_file = f"{SILVER_PATH}/_delta_log/00000000000000000000.json"
-content  = dbutils.fs.head(log_file)
+detail_df = spark.sql(f"DESCRIBE DETAIL {SILVER_TABLE}")
+detail = detail_df.collect()
 
-for line in content.split("\n")[:5]:
-    if line.strip():
-        print(json.dumps(json.loads(line), indent=2))
+table_location = detail["location"]
+num_files_before = detail["numFiles"]
+size_before = detail["sizeInBytes"]
+
+print(f"Location: {table_location}")
+print(f"Active files: {num_files_before}")
+print(f"Size in bytes: {size_before}")
 ```
 
-**Expected output (abridged)**:
-
-```json
-{
-  "add": {
-    "path": "subject_id=001/part-00000-abc123.snappy.parquet",
-    "size": 1345678,
-    "partitionValues": { "subject_id": "001" },
-    "modificationTime": 1718000000000,
-    "dataChange": true,
-    "stats": "{\"numRecords\":500,\"minValues\":{\"epoch_idx\":0},\"maxValues\":{\"epoch_idx\":499}}"
-  }
-}
-```
-
-| JSON field | Meaning |
-|---|---|
-| `add.path` | Parquet file added in this commit |
-| `add.partitionValues` | Partition key values for the file |
-| `add.stats` | Min/max column statistics used for data skipping |
-| `add.dataChange` | `true` if the commit adds or removes rows |
+The key idea is that the physical location is discovered from metadata rather than assumed in advance. [web:8]
 
 ---
 
-### Step 5 — Time travel by version number
+## Step 5 — Read the current version of the table
+
+Load the latest state of the Silver table:
 
 ```python
-df_v0 = (
+current_df = spark.table(SILVER_TABLE)
+
+display(current_df.limit(10))
+print(f"Current row count: {current_df.count()}")
+```
+
+For the latest version, `spark.table(SILVER_TABLE)` is simpler and clearer than reading by path. [web:11]
+
+---
+
+## Step 6 — Read a historical version by version number
+
+Use Delta Lake time travel to query an earlier snapshot:
+
+```python
+version_0_df = (
     spark.read
     .format("delta")
     .option("versionAsOf", 0)
-    .load(SILVER_PATH)
+    .table(SILVER_TABLE)
 )
 
-print(f"Version 0 — record count: {df_v0.count()}")
-df_v0.select("subject_id", "epoch_idx", "sleep_stage").show(5, truncate=False)
+print(f"Version 0 row count: {version_0_df.count()}")
+display(version_0_df.limit(10))
 ```
 
-**Expected output**:
-
-```
-Version 0 — record count: 15000
-+----------+---------+-----------+
-|subject_id|epoch_idx|sleep_stage|
-+----------+---------+-----------+
-|001       |0        |N2         |
-|001       |1        |N2         |
-|001       |2        |N3         |
-|001       |3        |REM        |
-|002       |0        |Wake       |
-+----------+---------+-----------+
-```
+You can replace `0` with any historical version shown by `DESCRIBE HISTORY`. Delta Lake supports version-based time travel directly from the registered table name. [web:11]
 
 ---
 
-### Step 6 — Time travel by timestamp
+## Step 7 — Read a historical version by timestamp
+
+You can also query the table as it existed at a specific timestamp:
 
 ```python
-one_hour_ago = (
-    datetime.datetime.now() - datetime.timedelta(hours=1)
-).strftime("%Y-%m-%d %H:%M:%S")
+timestamp_df = (
+    spark.read
+    .format("delta")
+    .option("timestampAsOf", "2026-06-21 23:30:00")
+    .table(SILVER_TABLE)
+)
 
-try:
-    df_ts = (
-        spark.read
-        .format("delta")
-        .option("timestampAsOf", one_hour_ago)
-        .load(SILVER_PATH)
-    )
-    print(f"Record count as of {one_hour_ago}: {df_ts.count()}")
-except Exception as exc:
-    print(f"Time travel unavailable for timestamp {one_hour_ago}: {exc}")
-    print("This is expected when the table was created less than one hour ago.")
+print(f"Timestamp snapshot row count: {timestamp_df.count()}")
+display(timestamp_df.limit(10))
 ```
+
+Choose a timestamp that falls within the table history shown by `DESCRIBE HISTORY`. Timestamp-based time travel is useful when you know when a change happened but do not know the exact version number. [web:11]
 
 ---
 
-### Step 7 — Inspect commit history
+## Step 8 — Compare versions
+
+Compare the current table to an earlier version:
 
 ```python
-delta_table = DeltaTable.forPath(spark, SILVER_PATH)
+current_count = spark.table(SILVER_TABLE).count()
 
+version_0_count = (
+    spark.read
+    .format("delta")
+    .option("versionAsOf", 0)
+    .table(SILVER_TABLE)
+    .count()
+)
+
+print(f"Current count:   {current_count}")
+print(f"Version 0 count: {version_0_count}")
+```
+
+If the counts are different, the table changed between those versions. Even if the counts match, the content or physical file layout may still differ because Delta versions track all committed changes, not only row-count changes. [web:11]
+
+---
+
+## Step 9 — Measure current file layout before OPTIMIZE
+
+Capture file count and size before compaction:
+
+```python
+detail_before = spark.sql(f"DESCRIBE DETAIL {SILVER_TABLE}").collect()
+
+files_before = detail_before["numFiles"]
+size_before = detail_before["sizeInBytes"]
+
+print(f"Files before OPTIMIZE: {files_before}")
+print(f"Size before OPTIMIZE: {size_before}")
+```
+
+This replaces any helper that counted Parquet files from `SILVER_PATH`. Using `DESCRIBE DETAIL` keeps the notebook compatible with managed tables. [web:8]
+
+---
+
+## Step 10 — Run OPTIMIZE
+
+Compact small files into fewer larger files:
+
+```sql
+OPTIMIZE eeg_lakehouse.silver.cleaned_epochs;
+```
+
+`OPTIMIZE` rewrites data files into a more efficient layout and creates a new Delta table version. It does not immediately delete the old superseded files from storage. [web:11]
+
+---
+
+## Step 11 — Verify file layout after OPTIMIZE
+
+Check whether the active file count changed:
+
+```python
+detail_after_optimize = spark.sql(f"DESCRIBE DETAIL {SILVER_TABLE}").collect()
+
+files_after_optimize = detail_after_optimize["numFiles"]
+size_after_optimize = detail_after_optimize["sizeInBytes"]
+
+print(f"Files after OPTIMIZE: {files_after_optimize}")
+print(f"Size after OPTIMIZE: {size_after_optimize}")
+```
+
+The active file count often decreases after compaction, while the table remains logically equivalent. The old files still exist until vacuum removes obsolete versions. [web:8][web:11]
+
+---
+
+## Step 12 — Apply ZORDER
+
+Run `OPTIMIZE` with `ZORDER BY` on a useful query column:
+
+```sql
+OPTIMIZE eeg_lakehouse.silver.cleaned_epochs
+ZORDER BY (subject_id);
+```
+
+`ZORDER` is most effective for columns frequently used in selective filters, especially when those columns have enough distinct values to improve file skipping. It is usually not helpful for very low-cardinality fields such as a Boolean flag. [page:1][web:11]
+
+### Example reasoning
+
+- Effective candidate: `subject_id`
+- Weak candidate: `is_artifact`
+
+A high-cardinality field lets related rows cluster more effectively across files, improving data skipping. A near-binary field tends to appear in most files anyway, so clustering provides little benefit. [page:1]
+
+---
+
+## Step 13 — Review history after OPTIMIZE and ZORDER
+
+Inspect the updated transaction history:
+
+```python
 (
     delta_table.history()
     .select("version", "timestamp", "operation", "operationParameters")
-    .show(10, truncate=False)
+    .show(20, truncate=False)
 )
 ```
 
-**Expected output**:
-
-```
-+-------+-------------------+---------+----------------------------------------+
-|version|timestamp          |operation|operationParameters                     |
-+-------+-------------------+---------+----------------------------------------+
-|1      |2026-06-22 00:30:00|WRITE    |{mode -> Overwrite, partitionBy -> [...]}|
-|0      |2026-06-21 23:00:00|WRITE    |{mode -> Overwrite, partitionBy -> [...]}|
-+-------+-------------------+---------+----------------------------------------+
-```
+You should see new history entries for the optimization operations. Delta history records the operation even though the table still appears as one logical dataset to readers. [web:11]
 
 ---
 
-### Step 8 — Profile file sizes before OPTIMIZE
+## Step 14 — Dry-run VACUUM
+
+Preview which obsolete files would be removed:
 
 ```python
-def count_parquet_files(path: str) -> dict:
-    """Return file count and average size in MB for Parquet files under path."""
-    all_files = dbutils.fs.ls(path)
-    parquet_files = [f for f in all_files if f.path.endswith(".parquet")]
-
-    if not parquet_files:
-        # Data is in partition sub-directories — inspect first partition
-        sub_dirs = [f for f in all_files if f.name.startswith("subject_id=")]
-        if sub_dirs:
-            parquet_files = [
-                f for f in dbutils.fs.ls(sub_dirs[0].path)
-                if f.path.endswith(".parquet")
-            ]
-
-    if not parquet_files:
-        return {"count": 0, "avg_mb": 0.0}
-
-    avg_mb = sum(f.size for f in parquet_files) / len(parquet_files) / 1024 / 1024
-    return {"count": len(parquet_files), "avg_mb": round(avg_mb, 2)}
-
-stats_before = count_parquet_files(SILVER_PATH)
-print(f"Before OPTIMIZE — files: {stats_before['count']}, avg size: {stats_before['avg_mb']} MB")
-```
-
----
-
-### Step 9 — Run OPTIMIZE (compaction)
-
-```python
-delta_table.optimize().executeCompaction()
-print("OPTIMIZE (compaction) complete.")
-```
-
-`OPTIMIZE` merges Parquet files below the 1 GB target size. Old file versions are retained in storage until `VACUUM` removes them.
-
----
-
-### Step 10 — Apply ZORDER on subject_id
-
-```python
-delta_table.optimize().executeZOrderBy("subject_id")
-print("OPTIMIZE with ZORDER on subject_id complete.")
-```
-
-| Column | Cardinality | Suitable for ZORDER? |
-|---|---|---|
-| `subject_id` | High (e.g., 200 unique values) | Yes — accelerates `WHERE subject_id = '001'` |
-| `sleep_stage` | Low (5 unique values) | Marginal benefit |
-| `is_artifact` | Very low (2 values) | No — no data skipping benefit |
-
----
-
-### Step 11 — Profile file sizes after OPTIMIZE
-
-```python
-stats_after = count_parquet_files(SILVER_PATH)
-print(f"After OPTIMIZE  — files: {stats_after['count']}, avg size: {stats_after['avg_mb']} MB")
-print("Old file versions still exist. Run VACUUM to remove them.")
-```
-
----
-
-### Step 12 — VACUUM dry run
-
-```python
-# Disable the 7-day retention safety check for demonstration purposes only.
-# Never disable this check in a production environment.
-spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
-
-delta_table.vacuum(retentionHours=0, dryRun=True)
+dry_run_df = spark.sql(f"VACUUM {SILVER_TABLE} RETAIN 0 HOURS DRY RUN")
+display(dry_run_df)
 print("Dry run complete — no files were deleted.")
 ```
 
-The dry run lists files that would be removed without deleting them. This is the correct way to preview the impact of `VACUUM`.
+A dry run is the safest way to preview the impact of vacuum. It reports the candidate files without removing them. [page:1]
+
+> **Warning**: This lab disables the retention safety check to make the behavior visible for learning, but production workloads should normally keep the default retention window rather than using zero-hour retention. Databricks history and Delta internals guidance both emphasize that aggressive vacuum settings can permanently remove files needed for time travel. [web:11][page:1]
 
 ---
 
-### Step 13 — Execute VACUUM
+## Step 15 — Execute VACUUM
+
+Run the actual cleanup:
 
 ```python
 delta_table.vacuum(retentionHours=0)
-print("VACUUM complete. Parquet files for superseded versions have been removed.")
+print("VACUUM complete. Obsolete files for superseded versions have been removed.")
 ```
 
-> **Warning**: Running `VACUUM` with `retentionHours=0` in production breaks time travel for all versions except the latest. Always use `retentionHours=168` (7 days) or higher in production workloads.
+`VACUUM` removes obsolete data files that are no longer required by the current table state. The transaction history remains, but historical reads may fail if their underlying files were deleted. [web:11]
+
+> **Production guidance**: Do not use `retentionHours=0` in production. Use at least the standard 7-day retention window unless you have a controlled exception and understand the recovery implications. [page:1][web:11]
 
 ---
 
-### Step 14 — Verify time travel failure after VACUUM
+## Step 16 — Verify time travel failure after VACUUM
+
+Try to read an older version again:
 
 ```python
 try:
@@ -387,63 +389,70 @@ try:
         spark.read
         .format("delta")
         .option("versionAsOf", 0)
-        .load(SILVER_PATH)
+        .table(SILVER_TABLE)
     )
     print(f"Version 0 accessible — record count: {df_check.count()}")
 except Exception as exc:
-    print("Expected FileNotFoundException: VACUUM removed the Parquet files for version 0.")
-    print(str(exc)[:200])
+    print("Expected failure: VACUUM removed the files required for version 0.")
+    print(str(exc)[:300])
 ```
+
+If vacuum removed the obsolete files for version 0, the historical query should fail even though the history metadata still exists. That distinction is central to understanding Delta Lake retention behavior. [web:11][page:1]
 
 ---
 
-### Step 15 — Inspect final commit history
+## Step 17 — Inspect final commit history
+
+Review the final history again:
 
 ```python
 (
     delta_table.history()
     .select("version", "timestamp", "operation")
-    .show(10, truncate=False)
+    .show(20, truncate=False)
 )
 ```
 
-**Expected output**:
+You should still see the older versions listed in the history output. `VACUUM` removes obsolete data files, not the logical history entries that describe past commits. [web:11][page:1]
 
-```
-+-------+-------------------+---------+
-|version|timestamp          |operation|
-+-------+-------------------+---------+
-|4      |2026-06-22 01:05:00|VACUUM   |
-|3      |2026-06-22 01:02:00|OPTIMIZE |
-|2      |2026-06-22 00:58:00|OPTIMIZE |
-|1      |2026-06-22 00:30:00|WRITE    |
-|0      |2026-06-21 23:00:00|WRITE    |
-+-------+-------------------+---------+
+---
+
+## Optional internals extension
+
+If your workspace permissions allow it, use the `location` field from `DESCRIBE DETAIL` to inspect the underlying storage directory and `_delta_log` manually. Treat this as an advanced exploration step, not a required dependency for the lab.
+
+Example optional exploration:
+
+```python
+detail = spark.sql(f"DESCRIBE DETAIL {SILVER_TABLE}").collect()
+table_location = detail["location"]
+
+print(table_location)
 ```
 
-Each `OPTIMIZE` and `VACUUM` execution creates a new version entry in the transaction log. The log entry itself persists; only the underlying Parquet data files are deleted by `VACUUM`.
+Only continue to direct file inspection if that location is accessible in your workspace. This keeps the main lab portable across managed-table environments. [web:8]
 
 ---
 
 ## Exam Reflection Questions
 
-Answer the following questions without referring to the notebook. These topics appear directly on the Databricks Data Engineer Professional exam.
+Answer the following questions without referring to the notebook. These topics appear directly in Delta Lake and Databricks workflow discussions covered by this lab. [web:11]
 
-1. What is stored in the `_delta_log/` directory, and why does it enable time travel?
-2. Write the PySpark expression to read a Delta table at version 3.
-3. Does `OPTIMIZE` delete old Parquet files? What command must follow it to reclaim storage?
-4. Give one column where `ZORDER` is highly effective and one where it is not. Explain why.
-5. What is the default `VACUUM` retention period, and what is the risk of setting it to zero?
-6. After running `VACUUM retentionHours=0`, will `DeltaTable.history()` still show version 0?
+1. Why is a Unity Catalog table name a safer primary reference than a manually hard-coded storage path in this project?
+2. What information does `DESCRIBE DETAIL` return, and why is it useful before and after `OPTIMIZE`?
+3. Write the PySpark expression to read version 3 of a Delta table by table name.
+4. Why can `DESCRIBE HISTORY` still show old versions after `VACUUM` has made time travel fail for those versions?
+5. Give one example of a good `ZORDER` column and one bad one. Explain why.
+6. What is the risk of running `VACUUM retentionHours=0`?
 
-**Reference answers**:
+### Reference answers
 
-1. The `_delta_log/` directory contains one JSON file per committed transaction. Each file records which Parquet files were added or removed. The runtime replays these entries to reconstruct any historical snapshot, enabling time travel.
-2. `spark.read.format("delta").option("versionAsOf", 3).load(path)`
-3. `OPTIMIZE` does **not** delete old files. Run `VACUUM` after `OPTIMIZE` to remove superseded Parquet files.
-4. High-cardinality: `subject_id` (200 unique subjects) — effective, because Spark can skip entire file groups. Low-cardinality: `is_artifact` (True/False only) — ineffective, because nearly every file contains both values.
-5. Default retention is 168 hours (7 days). Setting it to zero permanently removes Parquet files for all versions except the current one, making time travel impossible for those versions.
-6. Yes. `DeltaTable.history()` reads the transaction log JSON files, which `VACUUM` does not delete. Reading the data at version 0 will fail with `FileNotFoundException`, but the history entry remains.
+1. A table name is registered in the metastore and remains valid even if the physical storage location is abstracted or managed. A hard-coded path can be missing, renamed, or unknown in a managed Unity Catalog workflow. [web:8]
+2. `DESCRIBE DETAIL` returns metadata such as storage location, file count, table size, format, and partition columns. It is useful for measuring how physical layout changes after maintenance operations. [web:8]
+3. `spark.read.format("delta").option("versionAsOf", 3).table(SILVER_TABLE)` [web:11]
+4. Because history is stored as Delta transaction metadata, while `VACUUM` removes obsolete underlying data files. The version metadata can remain visible even when the files needed to reconstruct that version are gone. [web:11]
+5. Good: `subject_id` if analysts frequently filter by it and it has enough distinct values. Bad: `is_artifact` if it is only Boolean, because most files will still contain both values. [page:1]
+6. It can permanently delete the obsolete files needed for historical reads, breaking time travel and limiting rollback options. [web:11][page:1]
 
 ---
 
@@ -451,13 +460,26 @@ Answer the following questions without referring to the notebook. These topics a
 
 | Operation | Command | Side effect |
 |---|---|---|
-| List storage root | `dbutils.fs.ls(SILVER_PATH)` | Read-only |
-| Read commit log | `dbutils.fs.head(".../_delta_log/00...json")` | Read-only |
-| Time travel by version | `.option("versionAsOf", N)` | Read-only |
-| Time travel by timestamp | `.option("timestampAsOf", "YYYY-MM-DD HH:MM:SS")` | Read-only |
-| View history | `DeltaTable.history()` | Read-only |
-| Compact small files | `DeltaTable.optimize().executeCompaction()` | Writes new files; adds version |
-| Co-locate by column | `DeltaTable.optimize().executeZOrderBy("col")` | Writes new files; adds version |
-| Remove old files | `DeltaTable.vacuum(retentionHours=168)` | Deletes Parquet; adds version |
+| Define Delta handle | `DeltaTable.forName(spark, SILVER_TABLE)` | Read-only [web:11] |
+| Inspect table metadata | `DESCRIBE DETAIL eeg_lakehouse.silver.cleaned_epochs` | Read-only [web:8] |
+| Inspect commit history | `DESCRIBE HISTORY eeg_lakehouse.silver.cleaned_epochs` | Read-only [web:11] |
+| Read current table | `spark.table(SILVER_TABLE)` | Read-only [web:11] |
+| Time travel by version | `.option("versionAsOf", N).table(SILVER_TABLE)` | Read-only [web:11] |
+| Time travel by timestamp | `.option("timestampAsOf", "YYYY-MM-DD HH:MM:SS").table(SILVER_TABLE)` | Read-only [web:11] |
+| Compact files | `OPTIMIZE eeg_lakehouse.silver.cleaned_epochs` | Creates a new version [web:11] |
+| Co-locate data | `OPTIMIZE ... ZORDER BY (...)` | Creates a new version [web:11] |
+| Preview cleanup | `VACUUM ... DRY RUN` | Read-only preview [page:1] |
+| Remove obsolete files | `VACUUM ...` | Deletes obsolete files and can break time travel [web:11][page:1] |
 
-**Next**: Day 6 builds the Gold layer by computing per-subject sleep features and writing aggregated Delta tables for downstream machine learning.
+---
+
+## Improvement notes
+
+This revised version intentionally changes the teaching model from **path-first** to **table-first**. That matches the prerequisite in the current file, which guarantees the Silver table exists but does not guarantee a project-created `SILVER_PATH` folder exists. [page:1]
+
+It also separates three concepts more cleanly:
+- **Table identity**: `SILVER_TABLE`
+- **Metadata inspection**: `DESCRIBE DETAIL`
+- **History inspection**: `DESCRIBE HISTORY` / `DeltaTable.history()`
+
+That structure is more robust for Databricks and clearer for learners working with Unity Catalog managed tables. [web:8][web:11]
