@@ -7,19 +7,21 @@ Exam relevance (Domain 3 — Incremental Data Processing):
 - Checkpoint location enables exactly-once processing and crash recovery.
 
 Research relevance:
-- Ingests PhysioNet Sleep-EDF EDF files from a Unity Catalog Volume.
+- Ingests PhysioNet Sleep-EDF Expanded EDF files from a Unity Catalog Volume.
 - The Bronze table is a REGISTRY (metadata only) — raw EDF binary content is
   processed in Silver via Pandas UDFs using MNE-Python.
 - Idempotent: re-running never duplicates records (Auto Loader checkpoint tracks state).
+- FIXED: source_path now includes BOTH sleep-cassette and sleep-telemetry sub-dirs
+  so that the Auto Loader crawls the full 197-recording dataset, not just the root.
 
 Interview talking point:
-- "I used Auto Loader with schema evolution to ingest 400 EDF files from a UC Volume
+- "I used Auto Loader with schema evolution to ingest ~400 EDF files from a UC Volume
   into a Bronze Delta table. The checkpoint ensured exactly-once semantics even when
   the pipeline crashed mid-run."
 """
 
 import re
-from typing import Optional
+from typing import Optional, List
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
@@ -109,6 +111,27 @@ _extract_study_night_udf = F.udf(extract_study_night, IntegerType())
 
 
 # ---------------------------------------------------------------------------
+# Helper: resolve all EDF sub-directories to crawl
+# ---------------------------------------------------------------------------
+
+def _edf_source_paths(cfg: AppConfig) -> List[str]:
+    """Return the list of paths Auto Loader should crawl.
+
+    The Sleep-EDF Expanded dataset has two sub-directories under the Volume:
+      - sleep-cassette/  (SC* files)
+      - sleep-telemetry/ (ST* files)
+
+    Returning both ensures the full ~400-file dataset is ingested, not just
+    files sitting in the Volume root.
+    """
+    root = cfg.paths.edf_source_path
+    return [
+        f"{root}/sleep-cassette",
+        f"{root}/sleep-telemetry",
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Core ingestion function
 # ---------------------------------------------------------------------------
 
@@ -146,8 +169,9 @@ def load_raw_files(
         .option("cloudFiles.format", "binaryFile")  # Read EDF as binary
         .option("cloudFiles.schemaLocation", cfg.paths.autoloader_schema_location)
         .option("cloudFiles.useNotifications", "false")  # Directory listing mode
-        .option("cloudFiles.includeExistingFiles", "true")  # Process historical files
+        .option("cloudFiles.includeExistingFiles", "true")  # Process ALL historical files
         .option("pathGlobFilter", "*.edf")  # Only ingest EDF files
+        .option("recursiveFileLookup", "true")  # FIX: crawl sleep-cassette/ AND sleep-telemetry/
         .load(source_path)
     )
 
@@ -191,6 +215,9 @@ def create_bronze_table(
 ) -> None:
     """Write the Auto Loader stream to the Bronze Delta table.
 
+    FIXED: iterates over BOTH sub-directories (sleep-cassette + sleep-telemetry)
+    so that the full dataset is ingested in a single run.
+
     Exam notes on trigger types:
     - `trigger(once=True)`: Process all available files and stop. Batch-style.
     - `trigger(availableNow=True)`: Like once=True but with micro-batch parallelism.
@@ -204,29 +231,30 @@ def create_bronze_table(
         cfg: Application config.
         trigger_once: If True, use availableNow trigger (batch-style). Default True.
     """
-    source_path = cfg.paths.edf_source_path
     target_table = cfg.catalog.bronze_edf_fqn
-    checkpoint = cfg.paths.autoloader_checkpoint
+    checkpoint   = cfg.paths.autoloader_checkpoint
 
-    log.info(f"Writing Bronze table: {target_table}")
+    # Crawl BOTH sub-directories to capture the full dataset
+    source_paths = _edf_source_paths(cfg)
+    log.info(f"Writing Bronze table '{target_table}' from paths: {source_paths}")
 
-    stream_df = load_raw_files(spark, source_path, cfg)
+    for i, source_path in enumerate(source_paths):
+        # Each sub-directory gets its own checkpoint suffix to avoid conflicts
+        ckpt = f"{checkpoint}_{i}"
+        stream_df = load_raw_files(spark, source_path, cfg)
 
-    writer = (
-        stream_df.writeStream
-        .format("delta")
-        .outputMode("append")  # Bronze is append-only
-        .option("checkpointLocation", checkpoint)
-        .option("mergeSchema", "false")  # Strict: reject schema drift in Bronze
-    )
+        writer = (
+            stream_df.writeStream
+            .format("delta")
+            .outputMode("append")  # Bronze is append-only
+            .option("checkpointLocation", ckpt)
+            .option("mergeSchema", "false")  # Strict: reject schema drift in Bronze
+        )
 
-    if trigger_once:
-        # availableNow processes all pending files in micro-batches, then stops
-        query = writer.trigger(availableNow=True).toTable(target_table)
-        query.awaitTermination()
-    else:
-        # Continuous streaming — returns immediately, query runs in background
-        query = writer.trigger(processingTime="5 minutes").toTable(target_table)
-        return query
+        if trigger_once:
+            query = writer.trigger(availableNow=True).toTable(target_table)
+            query.awaitTermination()
+        else:
+            query = writer.trigger(processingTime="5 minutes").toTable(target_table)
 
     log.info(f"Bronze ingestion complete. Table: {target_table}")
